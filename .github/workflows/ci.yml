@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  api:
+    name: API
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cd apps/api && npm install
+      - run: cd apps/api && node --check src/index.js
+
+  observatory:
+    name: Observatory
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cd apps/observatory && npm install
+      - run: cd apps/observatory && npx tsc --noEmit
+      - run: cd apps/observatory && npx vite build
+
+  docker:
+    name: Docker Compose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start DB
+        run: docker compose up db -d
+      - name: Wait for DB
+        run: |
+          for i in $(seq 1 15); do
+            docker compose exec db pg_isready -U agent_trust && break || sleep 2
+          done
+      - name: Verify schema
+        run: |
+          docker compose exec db psql -U agent_trust -d agent_trust -c "\dt" | grep -q "agents"
+          docker compose exec db psql -U agent_trust -d agent_trust -c "\dt" | grep -q "provenance"
+          docker compose exec db psql -U agent_trust -d agent_trust -c "\dt" | grep -q "delegations"
+          docker compose exec db psql -U agent_trust -d agent_trust -c "\dt" | grep -q "memory"
+      - name: Cleanup
+        run: docker compose down -v
