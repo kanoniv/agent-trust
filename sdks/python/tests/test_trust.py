@@ -41,16 +41,25 @@ def test_register_no_capabilities(trust):
 # -- delegate --
 
 def test_delegate_grants_scopes(trust):
-    trust.register("researcher")
+    trust.register("researcher", capabilities=["search", "analyze"])
     deleg = trust.delegate("researcher", scopes=["search", "analyze"])
     assert deleg.scopes == ["search", "analyze"]
     assert deleg.agent == "researcher"
 
 def test_delegate_shows_in_reputation(trust):
-    trust.register("researcher")
+    trust.register("researcher", capabilities=["search"])
     trust.delegate("researcher", scopes=["search"])
     rep = trust.reputation("researcher")
     assert "search" in rep.current_scopes
+
+def test_delegate_rejects_invalid_scope(trust):
+    trust.register("researcher", capabilities=["search"])
+    with pytest.raises(ValueError, match="not in"):
+        trust.delegate("researcher", scopes=["deploy"])
+
+def test_delegate_rejects_unregistered_agent(trust):
+    with pytest.raises(ValueError, match="not found"):
+        trust.delegate("ghost", scopes=["search"])
 
 
 # -- observe --
@@ -171,14 +180,14 @@ def test_reputation_verified_count(trust):
 # -- enforce: restrict --
 
 def test_restrict_limits_scopes(trust):
-    trust.register("researcher")
+    trust.register("researcher", capabilities=["search", "analyze", "write"])
     trust.delegate("researcher", scopes=["search", "analyze", "write"])
     trust.restrict("researcher", scopes=["search"])
     rep = trust.reputation("researcher")
     assert rep.current_scopes == ["search"]
 
 def test_restrict_creates_provenance(trust):
-    trust.register("researcher")
+    trust.register("researcher", capabilities=["search", "write"])
     trust.delegate("researcher", scopes=["search", "write"])
     trust.restrict("researcher", scopes=["search"])
     provenance = trust._backend.get_provenance("trust-agent", limit=20)
@@ -187,7 +196,7 @@ def test_restrict_creates_provenance(trust):
     assert restrict_records[0].verified is True
 
 def test_restrict_nonexistent_delegation(trust):
-    trust.register("researcher")
+    trust.register("researcher", capabilities=["search"])
     result = trust.restrict("researcher", scopes=["search"])
     assert result is None
 
@@ -195,14 +204,14 @@ def test_restrict_nonexistent_delegation(trust):
 # -- enforce: revoke --
 
 def test_revoke_removes_all_scopes(trust):
-    trust.register("researcher")
+    trust.register("researcher", capabilities=["search", "write"])
     trust.delegate("researcher", scopes=["search", "write"])
     trust.revoke("researcher")
     rep = trust.reputation("researcher")
     assert rep.current_scopes == []
 
 def test_revoke_creates_provenance(trust):
-    trust.register("researcher")
+    trust.register("researcher", capabilities=["search"])
     trust.delegate("researcher", scopes=["search"])
     trust.revoke("researcher")
     provenance = trust._backend.get_provenance("trust-agent", limit=20)
@@ -283,8 +292,8 @@ def test_crypto_key_export_import():
 def test_full_trust_lifecycle(trust):
     """End-to-end: register -> delegate -> observe -> select -> restrict -> revoke."""
     # Setup
-    trust.register("researcher", capabilities=["search"])
-    trust.register("writer", capabilities=["write"])
+    trust.register("researcher", capabilities=["search", "analyze"])
+    trust.register("writer", capabilities=["write", "summarize"])
     trust.delegate("researcher", scopes=["search", "analyze"])
     trust.delegate("writer", scopes=["write", "summarize"])
 
@@ -409,14 +418,14 @@ def test_reputation_strengths_and_weaknesses(trust):
 # -- delegation edge cases --
 
 def test_delegate_replaces_previous(trust):
-    trust.register("agent")
+    trust.register("agent", capabilities=["search", "write", "read"])
     trust.delegate("agent", scopes=["search", "write"])
     trust.delegate("agent", scopes=["read"])
     rep = trust.reputation("agent")
     assert rep.current_scopes == ["read"]
 
 def test_restrict_then_delegate_restores(trust):
-    trust.register("agent")
+    trust.register("agent", capabilities=["search", "write", "admin"])
     trust.delegate("agent", scopes=["search", "write"])
     trust.restrict("agent", scopes=["search"])
     trust.delegate("agent", scopes=["search", "write", "admin"])

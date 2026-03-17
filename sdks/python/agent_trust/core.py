@@ -181,8 +181,20 @@ class TrustAgent:
     def delegate(self, agent: str, scopes: list[str]) -> Delegation:
         """Grant scoped delegation to an agent. Signed by the TrustAgent.
 
-        This is real authority - the agent can only act within these scopes.
+        Scopes must be a subset of the agent's registered capabilities.
+        You can't delegate what the agent can't do.
+
+        Raises ValueError if any scope is not in the agent's capabilities.
         """
+        record = self._backend.get_agent(agent)
+        if record is None:
+            raise ValueError(f"Agent '{agent}' not found. Call register() first.")
+        invalid = [s for s in scopes if s not in record.capabilities]
+        if invalid:
+            raise ValueError(
+                f"Scopes {invalid} not in {agent}'s capabilities {record.capabilities}. "
+                f"Register the agent with these capabilities first."
+            )
         delegation = self._backend.grant_delegation(self._name, agent, scopes)
         self._signed_provenance(
             action="delegate",
@@ -190,6 +202,21 @@ class TrustAgent:
             metadata={"scopes": scopes, "grantor": self._name},
         )
         return delegation
+
+    # -----------------------------------------------------------------
+    # authorized - check if an agent can perform an action
+    # -----------------------------------------------------------------
+
+    def authorized(self, agent: str, scope: str) -> bool:
+        """Check if an agent is authorized to perform an action.
+
+        Agents should call this before acting. Returns False if
+        the scope was never granted or has been restricted/revoked.
+        """
+        record = self._backend.get_agent(agent)
+        if record is None:
+            return False
+        return scope in record.scopes
 
     # -----------------------------------------------------------------
     # observe - record and verify an agent's action
@@ -375,8 +402,17 @@ class TrustAgent:
         """Restrict an agent's delegation to specific scopes.
 
         This is enforcement, not advisory. The agent loses permissions
-        for anything not in the new scope list.
+        for anything not in the new scope list. Scopes must be a subset
+        of the agent's registered capabilities.
         """
+        if scopes:
+            record = self._backend.get_agent(agent)
+            if record:
+                invalid = [s for s in scopes if s not in record.capabilities]
+                if invalid:
+                    raise ValueError(
+                        f"Scopes {invalid} not in {agent}'s capabilities {record.capabilities}."
+                    )
         result = self._backend.restrict_delegation(self._name, agent, scopes)
         if result:
             self._signed_provenance(
