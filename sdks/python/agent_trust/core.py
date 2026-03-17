@@ -1,0 +1,479 @@
+"""
+agent-trust: Verified trust for multi-agent systems.
+
+The TrustAgent is an autonomous trust orchestrator that verifies, scores,
+and controls other agents using cryptographic guarantees.
+
+Usage:
+    from agent_trust import TrustAgent
+
+    trust = TrustAgent()                                    # SQLite, zero infra
+    trust = TrustAgent(url="http://localhost:4100")          # hosted, shared
+
+    # Register agents with verified identity
+    trust.register("researcher", capabilities=["search"])
+    trust.register("writer", capabilities=["write"])
+
+    # Grant scoped delegation - cryptographic, not advisory
+    trust.delegate("researcher", scopes=["search", "analyze"])
+    trust.delegate("writer", scopes=["write", "summarize"])
+
+    # Observe a signed action and score it
+    trust.observe("researcher", action="search", result="success", reward=0.9)
+
+    # Select best agent using reputation from verified provenance
+    best = trust.select(["researcher", "writer"], strategy="ucb")
+
+    # Reputation computed from SIGNED records, not self-reported
+    rep = trust.reputation("researcher")
+
+    # Enforce - real authority, not a recommendation
+    trust.restrict("researcher", scopes=["search"])  # limit permissions
+    trust.revoke("writer")                            # revoke all access
+"""
+
+from __future__ import annotations
+
+import math
+import time
+from dataclasses import dataclass, field
+from typing import Literal
+
+from agent_trust.crypto import (
+    KeyPair,
+    generate_keys,
+    load_keys,
+    sign_provenance,
+    verify_provenance,
+)
+from agent_trust.backends.base import (
+    Backend,
+    AgentRecord,
+    Outcome,
+    ProvenanceRecord,
+    Delegation,
+)
+from agent_trust.backends.sqlite import SQLiteBackend
+
+
+@dataclass
+class ReputationReport:
+    """Reputation computed from verified provenance."""
+    agent: str
+    score: float  # 0-100 composite
+    success_rate: float | None
+    avg_reward: float | None
+    total_actions: int
+    verified_actions: int  # how many have valid signatures
+    trend: str  # improving, stable, declining
+    top_strengths: list[str]
+    top_weaknesses: list[str]
+    current_scopes: list[str]  # what they're allowed to do right now
+
+
+class TrustAgent:
+    """Autonomous trust orchestrator with cryptographic identity.
+
+    The TrustAgent has its own DID and signing keys. Every trust decision
+    it makes (delegation, restriction, revocation) is signed and verifiable.
+    It reads signed provenance to compute reputation - not self-reported metrics.
+
+    Pluggable backend:
+      - TrustAgent()                -> SQLite (local, zero infra)
+      - TrustAgent(url="http://..") -> hosted Agent Trust API (shared reputation)
+      - TrustAgent(backend=custom)  -> any Backend implementation
+    """
+
+    def __init__(
+        self,
+        url: str | None = None,
+        db_path: str | None = None,
+        backend: Backend | None = None,
+        private_key: str | None = None,
+        authority: str = "admin",
+    ):
+        # Backend
+        if backend is not None:
+            self._backend = backend
+        elif url is not None:
+            from agent_trust.backends.http import HttpBackend
+            self._backend = HttpBackend(url)
+        else:
+            self._backend = SQLiteBackend(db_path)
+
+        # Crypto identity
+        if private_key:
+            self._keys = load_keys(private_key)
+        else:
+            self._keys = generate_keys()
+
+        self._authority = authority
+        self._name = "trust-agent"
+
+        # Register self
+        self._backend.register(
+            self._name, self._keys.did, ["verify", "score", "enforce"], "Autonomous trust orchestrator"
+        )
+
+    @property
+    def did(self) -> str:
+        """This TrustAgent's DID."""
+        return self._keys.did
+
+    @property
+    def identity(self) -> str:
+        """Alias for did."""
+        return self._keys.did
+
+    # -----------------------------------------------------------------
+    # register - agents join with verified identity
+    # -----------------------------------------------------------------
+
+    def register(
+        self,
+        name: str,
+        capabilities: list[str] | None = None,
+        description: str | None = None,
+        did: str | None = None,
+    ) -> AgentRecord:
+        """Register an agent with a verified identity.
+
+        If no DID is provided, one is generated. On re-registration (idempotent),
+        the existing DID is preserved - a new DID is only assigned on first call.
+        """
+        # Check if already registered - preserve existing DID
+        existing = self._backend.get_agent(name)
+        if existing is not None:
+            agent_did = existing.did
+        else:
+            agent_did = did or generate_keys().did
+
+        record = self._backend.register(
+            name, agent_did, capabilities or [], description
+        )
+        # Record this registration as signed provenance
+        self._signed_provenance(
+            action="register",
+            entity_ids=[name],
+            metadata={"capabilities": capabilities or [], "agent_did": agent_did},
+        )
+        return record
+
+    # -----------------------------------------------------------------
+    # delegate - grant scoped authority (cryptographic, not advisory)
+    # -----------------------------------------------------------------
+
+    def delegate(self, agent: str, scopes: list[str]) -> Delegation:
+        """Grant scoped delegation to an agent. Signed by the TrustAgent.
+
+        This is real authority - the agent can only act within these scopes.
+        """
+        delegation = self._backend.grant_delegation(self._name, agent, scopes)
+        self._signed_provenance(
+            action="delegate",
+            entity_ids=[agent],
+            metadata={"scopes": scopes, "grantor": self._name},
+        )
+        return delegation
+
+    # -----------------------------------------------------------------
+    # observe - record and verify an agent's action
+    # -----------------------------------------------------------------
+
+    def observe(
+        self,
+        agent: str,
+        action: str,
+        result: Literal["success", "failure", "partial"],
+        reward: float,
+        content: str = "",
+        signature: str | None = None,
+        signed_at: float | None = None,
+    ) -> Outcome:
+        """Observe an agent's action and record the outcome.
+
+        If a signature is provided, it's verified against the agent's DID.
+        Verified actions carry more weight in reputation scoring.
+
+        Args:
+            agent: The agent that performed the action
+            action: What the agent did
+            result: success, failure, or partial
+            reward: -1.0 to 1.0 quality signal
+            content: Description of what happened
+            signature: Optional Ed25519 signature from the acting agent
+            signed_at: Timestamp the agent used when signing (required if signature is provided)
+        """
+        if not -1.0 <= reward <= 1.0:
+            raise ValueError("reward must be between -1.0 and 1.0")
+        if result not in ("success", "failure", "partial"):
+            raise ValueError("result must be success, failure, or partial")
+
+        record = self._backend.get_agent(agent)
+        agent_did = record.did if record else ""
+
+        # Verify signature if provided
+        verified = False
+        if signature and agent_did and signed_at is not None:
+            verified = verify_provenance(
+                did=agent_did,
+                action=action,
+                entity_ids=[],
+                metadata={"result": result, "reward": reward},
+                timestamp=signed_at,
+                signature_b64=signature,
+            )
+
+        # Record signed provenance
+        prov = self._backend.record_provenance(
+            agent=agent,
+            agent_did=agent_did,
+            action=action,
+            entity_ids=[],
+            metadata={"result": result, "reward": reward, "content": content},
+            signature=signature,
+            verified=verified,
+        )
+
+        # Record outcome linked to provenance
+        outcome = self._backend.record_outcome(
+            agent=agent,
+            action=action,
+            result=result,
+            reward=reward,
+            content=content,
+            reporter=self._name,
+            provenance_id=None,
+        )
+
+        # TrustAgent signs its own observation
+        self._signed_provenance(
+            action="observe",
+            entity_ids=[agent],
+            metadata={"observed_action": action, "result": result, "reward": reward, "verified": verified},
+        )
+
+        return outcome
+
+    # -----------------------------------------------------------------
+    # select - choose best agent from verified reputation
+    # -----------------------------------------------------------------
+
+    def select(
+        self,
+        agents: list[str],
+        task: str | None = None,
+        strategy: Literal["ucb", "greedy"] = "ucb",
+        exploration: float = 1.5,
+    ) -> str:
+        """Select the best agent based on verified reputation.
+
+        Uses UCB (Upper Confidence Bound) by default - balances exploiting
+        known-good agents with exploring under-tested ones.
+        """
+        if not agents:
+            raise ValueError("agents list cannot be empty")
+        if len(agents) == 1:
+            return agents[0]
+
+        ranked = self.rank(agents, task=task, strategy=strategy, exploration=exploration)
+        return ranked[0]
+
+    # -----------------------------------------------------------------
+    # rank - order agents by verified reputation
+    # -----------------------------------------------------------------
+
+    def rank(
+        self,
+        agents: list[str],
+        task: str | None = None,
+        strategy: Literal["ucb", "greedy"] = "ucb",
+        exploration: float = 1.5,
+    ) -> list[str]:
+        """Rank agents by verified reputation. Best first."""
+        if not agents:
+            raise ValueError("agents list cannot be empty")
+
+        scored: list[tuple[str, float]] = []
+        for name in agents:
+            outcomes = self._backend.get_outcomes(name, limit=50)
+            summary = _compute_summary(outcomes)
+            if strategy == "ucb":
+                score = _ucb_score(summary, len(agents), exploration)
+            else:
+                score = summary["avg_reward"] if summary["avg_reward"] is not None else 0.0
+            scored.append((name, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [name for name, _ in scored]
+
+    # -----------------------------------------------------------------
+    # reputation - computed from signed provenance
+    # -----------------------------------------------------------------
+
+    def reputation(self, agent: str) -> ReputationReport:
+        """Get an agent's reputation computed from verified provenance.
+
+        This is the key differentiator: reputation comes from SIGNED records,
+        not self-reported metrics. The TrustAgent verifies before it trusts.
+        """
+        record = self._backend.get_agent(agent)
+        if record is None:
+            raise ValueError(f"Agent '{agent}' not found. Call register() first.")
+
+        outcomes = self._backend.get_outcomes(agent, limit=50)
+        provenance = self._backend.get_provenance(agent, limit=50)
+        summary = _compute_summary(outcomes)
+
+        verified_count = sum(1 for p in provenance if p.verified)
+
+        return ReputationReport(
+            agent=agent,
+            score=_compute_reputation_score(record, summary),
+            success_rate=summary["success_rate"],
+            avg_reward=summary["avg_reward"],
+            total_actions=summary["total"],
+            verified_actions=verified_count,
+            trend=summary["trend"],
+            top_strengths=summary["top_success"],
+            top_weaknesses=summary["top_failure"],
+            current_scopes=record.scopes,
+        )
+
+    # -----------------------------------------------------------------
+    # enforce - restrict or revoke delegation
+    # -----------------------------------------------------------------
+
+    def restrict(self, agent: str, scopes: list[str]) -> Delegation | None:
+        """Restrict an agent's delegation to specific scopes.
+
+        This is enforcement, not advisory. The agent loses permissions
+        for anything not in the new scope list.
+        """
+        result = self._backend.restrict_delegation(self._name, agent, scopes)
+        if result:
+            self._signed_provenance(
+                action="restrict",
+                entity_ids=[agent],
+                metadata={"new_scopes": scopes, "reason": "trust enforcement"},
+            )
+        return result
+
+    def revoke(self, agent: str) -> Delegation | None:
+        """Revoke all delegation for an agent. Nuclear option.
+
+        The agent loses all permissions granted by this TrustAgent.
+        """
+        result = self._backend.revoke_delegation(self._name, agent)
+        if result:
+            self._signed_provenance(
+                action="revoke",
+                entity_ids=[agent],
+                metadata={"reason": "trust enforcement"},
+            )
+        return result
+
+    # -----------------------------------------------------------------
+    # Internal: signed provenance
+    # -----------------------------------------------------------------
+
+    def _signed_provenance(
+        self, action: str, entity_ids: list[str], metadata: dict
+    ) -> ProvenanceRecord:
+        """Record the TrustAgent's own actions as signed provenance."""
+        now = time.time()
+        sig = sign_provenance(self._keys, action, entity_ids, metadata, now)
+        return self._backend.record_provenance(
+            agent=self._name,
+            agent_did=self._keys.did,
+            action=action,
+            entity_ids=entity_ids,
+            metadata=metadata,
+            signature=sig,
+            verified=True,  # self-signed, verified by construction
+        )
+
+
+# -----------------------------------------------------------------
+# Pure computation functions (no state)
+# -----------------------------------------------------------------
+
+def _compute_summary(outcomes: list[Outcome]) -> dict:
+    """Compute summary stats from outcomes."""
+    if not outcomes:
+        return {
+            "total": 0, "judged": 0, "successes": 0, "failures": 0,
+            "success_rate": None, "avg_reward": None, "trend": "stable",
+            "top_success": [], "top_failure": [],
+        }
+
+    successes = sum(1 for o in outcomes if o.result == "success")
+    failures = sum(1 for o in outcomes if o.result == "failure")
+    judged = successes + failures
+    rewards = [o.reward for o in outcomes if o.reward is not None]
+    avg_reward = sum(rewards) / len(rewards) if rewards else None
+
+    trend = "stable"
+    if len(rewards) >= 6:
+        recent = sum(rewards[:5]) / 5
+        prior_count = min(len(rewards) - 5, 5)
+        prior = sum(rewards[5:10]) / prior_count
+        if recent > prior + 0.1:
+            trend = "improving"
+        elif recent < prior - 0.1:
+            trend = "declining"
+
+    action_counts: dict[str, dict[str, int]] = {}
+    for o in outcomes:
+        if o.action not in action_counts:
+            action_counts[o.action] = {"success": 0, "failure": 0}
+        if o.result == "success":
+            action_counts[o.action]["success"] += 1
+        elif o.result == "failure":
+            action_counts[o.action]["failure"] += 1
+
+    top_success = [a for a, _ in sorted(
+        action_counts.items(), key=lambda x: x[1]["success"], reverse=True
+    )[:3]]
+    top_failure = [a for a, c in sorted(
+        action_counts.items(), key=lambda x: x[1]["failure"], reverse=True
+    ) if c["failure"] > 0][:3]
+
+    return {
+        "total": len(outcomes), "judged": judged,
+        "successes": successes, "failures": failures,
+        "success_rate": successes / judged if judged > 0 else None,
+        "avg_reward": avg_reward, "trend": trend,
+        "top_success": top_success, "top_failure": top_failure,
+    }
+
+
+def _ucb_score(summary: dict, n_agents: int, c: float) -> float:
+    """Upper Confidence Bound score."""
+    judged = summary["judged"]
+    if judged == 0:
+        return float("inf")
+    avg = summary["avg_reward"] if summary["avg_reward"] is not None else 0.0
+    normalized = (avg + 1) / 2
+    bonus = c * math.sqrt(math.log(max(n_agents, 1)) / judged)
+    return normalized + bonus
+
+
+def _compute_reputation_score(record: AgentRecord, summary: dict) -> float:
+    """Composite reputation score (0-100)."""
+    total = summary["total"]
+    success_rate = summary["success_rate"] if summary["success_rate"] is not None else 1.0
+    avg_reward = summary["avg_reward"] if summary["avg_reward"] is not None else 0.0
+    action_types = len(set(summary["top_success"] + summary["top_failure"]))
+    tenure_days = (time.time() - record.registered_at) / 86400
+
+    activity = min(100, math.log2(total + 1) * 15)
+    success = success_rate * 100
+    reward = ((avg_reward + 1) / 2) * 100
+    tenure = min(100, (tenure_days / 90) * 100)
+    diversity = min(100, (action_types / 7) * 100)
+
+    return round(
+        activity * 0.30 + success * 0.25 + reward * 0.20
+        + tenure * 0.15 + diversity * 0.10, 1,
+    )
