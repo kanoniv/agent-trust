@@ -1,5 +1,6 @@
 import express from 'express';
 import pg from 'pg';
+import { computeRecallSummary, parseWindow } from './recall.js';
 
 const { Pool } = pg;
 const app = express();
@@ -20,23 +21,27 @@ const pool = new Pool({
 
 // Extract agent name from header
 function agentName(req) {
-  return req.headers['x-agent-name'] || 'unknown';
+  return req.headers['x-agent-name'] || 'observatory';
 }
 
 // Auto-provenance: record action + outcome after successful mutations
-async function recordProvenance(agent, action, entityIds, metadata) {
+async function recordProvenance(agent, action, entityIds, metadata, subjectDid) {
   try {
+    // Look up the acting agent's DID
+    const agentRow = await pool.query(`SELECT did FROM agents WHERE name = $1`, [agent]);
+    const agentDid = agentRow.rows[0]?.did || null;
+
     await pool.query(
-      `INSERT INTO provenance (agent_name, action, entity_ids, metadata) VALUES ($1, $2, $3, $4)`,
-      [agent, action, entityIds, JSON.stringify(metadata)]
+      `INSERT INTO provenance (agent_name, agent_did, action, entity_ids, metadata) VALUES ($1, $2, $3, $4, $5)`,
+      [agent, agentDid, action, entityIds, JSON.stringify(metadata)]
     );
     const slug = `auto-outcome-${action}-${Date.now()}`;
     await pool.query(
-      `INSERT INTO memory (entry_type, slug, title, content, metadata, author)
-       VALUES ('outcome', $1, $2, $3, $4, $5)`,
+      `INSERT INTO memory (entry_type, slug, title, content, metadata, author, subject_did)
+       VALUES ('outcome', $1, $2, $3, $4, $5, $6)`,
       [slug, `${action}: success`, `Auto-recorded ${action} by ${agent}`,
        JSON.stringify({ action, result: 'success', reward_signal: 1.0, auto_recorded: true }),
-       `agent:${agent}`]
+       `agent:${agent}`, subjectDid || null]
     );
   } catch (e) {
     console.error('Auto-provenance failed:', e.message);
@@ -110,17 +115,21 @@ app.get('/v1/agents/:name', async (req, res) => {
 // Delegations
 // ---------------------------------------------------------------------------
 app.post('/v1/delegations', async (req, res) => {
-  const { agent_name, scopes, source_restrictions, expires_at } = req.body;
+  const { agent_name, scopes, source_restrictions, expires_at, metadata } = req.body;
   const grantor = agentName(req);
   if (!agent_name || !scopes?.length) return res.status(400).json({ error: 'agent_name and scopes required' });
 
   try {
+    const caveats = metadata || {};
     const result = await pool.query(
-      `INSERT INTO delegations (grantor_name, agent_name, scopes, source_restrictions, expires_at)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [grantor, agent_name, scopes, source_restrictions || null, expires_at || null]
+      `INSERT INTO delegations (grantor_name, agent_name, scopes, source_restrictions, caveats, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [grantor, agent_name, scopes, source_restrictions || null, JSON.stringify(caveats), expires_at || null]
     );
-    await recordProvenance(grantor, 'delegate', [], { delegated_to: agent_name, scopes });
+    // Look up the delegatee's DID as the subject
+    const delegateeRow = await pool.query(`SELECT did FROM agents WHERE name = $1`, [agent_name]);
+    const delegateeDid = delegateeRow.rows[0]?.did || null;
+    await recordProvenance(grantor, 'delegate', [], { delegated_to: agent_name, scopes, caveats, expires_at }, delegateeDid);
     res.json(result.rows[0]);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -143,6 +152,21 @@ app.get('/v1/delegations', async (req, res) => {
   }
 });
 
+app.put('/v1/delegations/:id', async (req, res) => {
+  const { scopes } = req.body;
+  if (!scopes || !Array.isArray(scopes)) return res.status(400).json({ error: 'scopes array required' });
+  try {
+    const result = await pool.query(
+      `UPDATE delegations SET scopes = $2 WHERE id = $1 AND revoked_at IS NULL RETURNING *`,
+      [req.params.id, scopes]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });
+    res.json(result.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.delete('/v1/delegations/:id', async (req, res) => {
   try {
     const result = await pool.query(
@@ -150,7 +174,10 @@ app.delete('/v1/delegations/:id', async (req, res) => {
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });
-    await recordProvenance(agentName(req), 'revoke', [], { delegation_id: req.params.id });
+    // Subject is the agent whose delegation was revoked
+    const revokedAgent = result.rows[0]?.agent_name;
+    const revokedRow = revokedAgent ? await pool.query(`SELECT did FROM agents WHERE name = $1`, [revokedAgent]) : { rows: [] };
+    await recordProvenance(agentName(req), 'revoke', [], { delegation_id: req.params.id }, revokedRow.rows[0]?.did || null);
     res.json(result.rows[0]);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -210,14 +237,14 @@ app.get('/v1/memory', async (req, res) => {
 });
 
 app.post('/v1/memory', async (req, res) => {
-  const { entry_type, slug, title, content, metadata, linked_agents, author } = req.body;
+  const { entry_type, slug, title, content, metadata, linked_agents, author, subject_did } = req.body;
   if (!entry_type || !title) return res.status(400).json({ error: 'entry_type and title required' });
   const finalSlug = slug || `${entry_type}-${Date.now()}`;
   try {
     const result = await pool.query(
-      `INSERT INTO memory (entry_type, slug, title, content, metadata, linked_agents, author)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-      [entry_type, finalSlug, title, content || '', JSON.stringify(metadata || {}), linked_agents || [], author || 'system']
+      `INSERT INTO memory (entry_type, slug, title, content, metadata, linked_agents, author, subject_did)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [entry_type, finalSlug, title, content || '', JSON.stringify(metadata || {}), linked_agents || [], author || 'system', subject_did || null]
     );
     res.json(result.rows[0]);
   } catch (e) {
@@ -239,6 +266,83 @@ app.put('/v1/memory/:id', async (req, res) => {
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });
     res.json(result.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Recall - in-context RL: retrieve outcomes + summary for a DID
+// ---------------------------------------------------------------------------
+app.get('/v1/memory/recall', async (req, res) => {
+  const { did, entry_type, limit: rawLimit } = req.query;
+  if (!did) return res.status(400).json({ error: 'did query parameter required' });
+  const limit = parseInt(rawLimit) || 50;
+
+  try {
+    // Fetch outcomes (or all entries) for this DID - as subject OR as author
+    let typeFilter = '';
+    const params = [did, limit];
+    if (entry_type) {
+      typeFilter = ' AND entry_type = $3';
+      params.push(entry_type);
+    }
+    const result = await pool.query(
+      `SELECT * FROM memory
+       WHERE (subject_did = $1 OR author = (SELECT 'agent:' || name FROM agents WHERE did = $1 LIMIT 1))
+         AND status = 'active'${typeFilter}
+       ORDER BY created_at DESC LIMIT $2`,
+      params
+    );
+
+    const summary = computeRecallSummary(result.rows);
+    res.json({ did, summary, entries: result.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Trend - time-series reward signals for Observatory charts
+// ---------------------------------------------------------------------------
+app.get('/v1/memory/trend', async (req, res) => {
+  const { did, window: rawWindow } = req.query;
+  if (!did) return res.status(400).json({ error: 'did query parameter required' });
+
+  const parsed = parseWindow(rawWindow);
+  if (!parsed) return res.status(400).json({ error: 'window must be like 7d or 24h' });
+  const { windowStr, interval, bucket, truncField } = parsed;
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         date_trunc($1, created_at) AS bucket,
+         COUNT(*) AS total,
+         COUNT(*) FILTER (WHERE metadata->>'result' = 'success') AS successes,
+         COUNT(*) FILTER (WHERE metadata->>'result' = 'failure') AS failures,
+         AVG((metadata->>'reward_signal')::float) FILTER (WHERE metadata->>'reward_signal' IS NOT NULL) AS avg_reward
+       FROM memory
+       WHERE entry_type = 'outcome'
+         AND (subject_did = $2 OR author = (SELECT 'agent:' || name FROM agents WHERE did = $2 LIMIT 1))
+         AND status = 'active'
+         AND created_at >= now() - $3::interval
+       GROUP BY bucket
+       ORDER BY bucket ASC`,
+      [truncField, did, interval]
+    );
+
+    res.json({
+      did,
+      window: windowStr,
+      bucket,
+      points: result.rows.map(r => ({
+        time: r.bucket,
+        total: parseInt(r.total),
+        successes: parseInt(r.successes),
+        failures: parseInt(r.failures),
+        avg_reward: r.avg_reward ? parseFloat(r.avg_reward) : null,
+      })),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

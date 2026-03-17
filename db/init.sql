@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS delegations (
     agent_name TEXT NOT NULL REFERENCES agents(name),
     scopes TEXT[] NOT NULL DEFAULT '{}',
     source_restrictions TEXT[],
+    caveats JSONB NOT NULL DEFAULT '{}',
     expires_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     revoked_at TIMESTAMPTZ
@@ -55,6 +56,7 @@ CREATE TABLE IF NOT EXISTS memory (
     content TEXT NOT NULL DEFAULT '',
     metadata JSONB NOT NULL DEFAULT '{}',
     linked_agents TEXT[] NOT NULL DEFAULT '{}',
+    subject_did TEXT,
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded', 'resolved', 'archived')),
     author TEXT NOT NULL DEFAULT 'system',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -64,6 +66,7 @@ CREATE TABLE IF NOT EXISTS memory (
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(entry_type, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_author ON memory(author, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_status ON memory(status);
+CREATE INDEX IF NOT EXISTS idx_memory_subject_did ON memory(subject_did, created_at DESC) WHERE subject_did IS NOT NULL;
 
 -- Seed a system agent
 INSERT INTO agents (name, description, capabilities, reputation)

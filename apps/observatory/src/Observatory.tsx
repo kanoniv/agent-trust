@@ -4,6 +4,7 @@ import {
   Star, TrendingUp, Clock, CheckCircle2, XCircle, AlertTriangle,
   ArrowRight, RefreshCw, Zap, Eye, Link2, Plus, Trash2,
   ClipboardList, Brain, Send, Settings, ExternalLink, Check,
+  BarChart3, RotateCw,
 } from 'lucide-react';
 
 const GOLD = '#C19A5B';
@@ -37,7 +38,7 @@ async function apiFetch(path: string, options: RequestInit = {}): Promise<Respon
   const headers: Record<string, string> = { ...(options.headers as Record<string, string> || {}) };
   if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
   if (conn.apiKey) headers['X-API-Key'] = conn.apiKey;
-  if (conn.agentName) headers['X-Agent-Name'] = conn.agentName;
+  headers['X-Agent-Name'] = conn.agentName || 'observatory';
   return fetch(`${base}${path}`, { ...options, headers });
 }
 
@@ -244,9 +245,48 @@ interface MemoryEntry {
   created_at: string;
 }
 
-const DELEGATION_SCOPES = [
-  'resolve', 'search', 'merge', 'split', 'mutate',
-  'simulate', 'memory.read', 'memory.write', 'events', 'ingest',
+interface RecallSummary {
+  total_outcomes: number;
+  successes: number;
+  failures: number;
+  success_rate: number | null;
+  avg_reward: number | null;
+  recent_trend: 'improving' | 'declining' | 'stable';
+  top_success_actions: string[];
+  top_failure_actions: string[];
+}
+
+interface RecallResponse {
+  did: string;
+  summary: RecallSummary;
+  entries: OutcomeEntry[];
+}
+
+interface TrendPoint {
+  time: string;
+  total: number;
+  successes: number;
+  failures: number;
+  avg_reward: number | null;
+}
+
+interface TrendResponse {
+  did: string;
+  window: string;
+  bucket: string;
+  points: TrendPoint[];
+}
+
+const DEFAULT_SCOPES = [
+  'read', 'write', 'execute', 'delegate', 'admin',
+];
+
+const EXPIRY_OPTIONS = [
+  { label: '1 hour', value: 1 },
+  { label: '24 hours', value: 24 },
+  { label: '7 days', value: 168 },
+  { label: '30 days', value: 720 },
+  { label: 'No expiry', value: 0 },
 ];
 
 // ---------------------------------------------------------------------------
@@ -502,15 +542,23 @@ export const Observatory: React.FC = () => {
   // Action form state
   const [showGrantForm, setShowGrantForm] = useState(false);
   const [grantScopes, setGrantScopes] = useState<string[]>([]);
+  const [grantCustomScope, setGrantCustomScope] = useState('');
+  const [grantExpiry, setGrantExpiry] = useState(0);
+  const [grantMaxCost, setGrantMaxCost] = useState('');
+  const [grantResources, setGrantResources] = useState('');
   const [showTaskForm, setShowTaskForm] = useState(false);
   const [taskTitle, setTaskTitle] = useState('');
   const [taskContent, setTaskContent] = useState('');
   const [taskPriority, setTaskPriority] = useState('medium');
+  const [taskAssignee, setTaskAssignee] = useState('');
   const [showMemoryForm, setShowMemoryForm] = useState(false);
   const [memoryTitle, setMemoryTitle] = useState('');
   const [memoryContent, setMemoryContent] = useState('');
   const [memoryType, setMemoryType] = useState('knowledge');
   const [actionLoading, setActionLoading] = useState(false);
+  const [recallData, setRecallData] = useState<RecallResponse | null>(null);
+  const [trendData, setTrendData] = useState<TrendResponse | null>(null);
+  const [trendWindow, setTrendWindow] = useState('7d');
 
   const fetchData = useCallback(async () => {
     try {
@@ -562,13 +610,28 @@ export const Observatory: React.FC = () => {
   const handleGrantDelegation = async () => {
     if (!selectedAgent || grantScopes.length === 0) return;
     setActionLoading(true);
+    const expiresAt = grantExpiry > 0
+      ? new Date(Date.now() + grantExpiry * 3600000).toISOString()
+      : null;
+    const caveats: Record<string, unknown> = {};
+    if (grantMaxCost) caveats.max_cost = parseFloat(grantMaxCost);
+    if (grantResources) caveats.resources = grantResources.split(',').map(s => s.trim()).filter(Boolean);
     try {
       await apiFetch('/v1/delegations', {
         method: 'POST',
-        body: JSON.stringify({ agent_name: selectedAgent, scopes: grantScopes }),
+        body: JSON.stringify({
+          agent_name: selectedAgent,
+          scopes: grantScopes,
+          expires_at: expiresAt,
+          ...(Object.keys(caveats).length > 0 ? { source_restrictions: null, metadata: caveats } : {}),
+        }),
       });
       setShowGrantForm(false);
       setGrantScopes([]);
+      setGrantCustomScope('');
+      setGrantExpiry(0);
+      setGrantMaxCost('');
+      setGrantResources('');
       fetchData();
     } catch { /* silent */ }
     finally { setActionLoading(false); }
@@ -583,8 +646,26 @@ export const Observatory: React.FC = () => {
     finally { setActionLoading(false); }
   };
 
+  const handleRemoveScope = async (delegationId: string, currentScopes: string[], scopeToRemove: string) => {
+    const newScopes = currentScopes.filter(s => s !== scopeToRemove);
+    if (newScopes.length === 0) {
+      // Last scope - revoke the whole delegation
+      return handleRevokeDelegation(delegationId);
+    }
+    setActionLoading(true);
+    try {
+      await apiFetch(`/v1/delegations/${delegationId}`, {
+        method: 'PUT',
+        body: JSON.stringify({ scopes: newScopes }),
+      });
+      fetchData();
+    } catch { /* silent */ }
+    finally { setActionLoading(false); }
+  };
+
   const handleCreateTask = async () => {
-    if (!selectedAgent || !taskTitle) return;
+    const assignee = taskAssignee || selectedAgent;
+    if (!assignee || !taskTitle) return;
     setActionLoading(true);
     const slug = `task-${taskTitle.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 180)}-${Date.now()}`;
     try {
@@ -596,7 +677,7 @@ export const Observatory: React.FC = () => {
           title: taskTitle,
           content: taskContent,
           author: 'observatory',
-          metadata: { assigned_to: selectedAgent, priority: taskPriority, status: 'open' },
+          metadata: { assigned_to: assignee, priority: taskPriority, status: 'open' },
         }),
       });
       setShowTaskForm(false);
@@ -656,9 +737,31 @@ export const Observatory: React.FC = () => {
     finally { setActionLoading(false); }
   };
 
+  // Derive the selected agent's DID (stable reference - only changes when agent or selection changes)
+  const selectedDid = agents.find(a => a.name === selectedAgent)?.did ?? null;
+
+  // Fetch recall + trend data when an agent with a DID is selected
+  useEffect(() => {
+    if (!selectedDid) {
+      setRecallData(null);
+      setTrendData(null);
+      return;
+    }
+    const fetchRL = async () => {
+      try {
+        const [recallRes, trendRes] = await Promise.all([
+          apiFetch(`/v1/memory/recall?did=${encodeURIComponent(selectedDid)}&entry_type=outcome`),
+          apiFetch(`/v1/memory/trend?did=${encodeURIComponent(selectedDid)}&window=${trendWindow}`),
+        ]);
+        if (recallRes.ok) setRecallData(await recallRes.json());
+        if (trendRes.ok) setTrendData(await trendRes.json());
+      } catch { /* silent */ }
+    };
+    fetchRL();
+  }, [selectedDid, trendWindow]);
+
   const selected = agents.find(a => a.name === selectedAgent);
   const selectedProvenance = provenance.filter(p => p.agent_name === selectedAgent);
-  const selectedOutcomes = outcomes.filter(o => o.author === `agent:${selectedAgent}`);
   const selectedDelegations = delegations.filter(d => d.agent_name === selectedAgent || d.grantor_name === selectedAgent);
   const selectedTasks = tasks.filter(t => t.metadata?.assigned_to === selectedAgent);
   const selectedMemories = memories.filter(m => m.author === `agent:${selectedAgent}` || m.author === 'observatory');
@@ -983,32 +1086,120 @@ export const Observatory: React.FC = () => {
                     </div>
                     <div className="flex flex-wrap gap-1 mt-1.5">
                       {d.scopes.map(s => (
-                        <span key={s} className="text-[8px] px-1 py-0.5 rounded bg-violet-500/10 text-violet-400">{s}</span>
+                        <span key={s} className="inline-flex items-center gap-0.5 text-[8px] px-1 py-0.5 rounded bg-violet-500/10 text-violet-400 group">
+                          {s}
+                          {!d.revoked_at && d.scopes.length > 1 && (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); handleRemoveScope(d.id, d.scopes, s); }}
+                              className="opacity-0 group-hover:opacity-100 ml-0.5 hover:text-red-400 transition-all"
+                              title={`Remove ${s}`}
+                            >
+                              <XCircle className="w-2.5 h-2.5" />
+                            </button>
+                          )}
+                        </span>
                       ))}
                     </div>
+                    {d.expires_at && (
+                      <div className="flex items-center gap-1 mt-1">
+                        <Clock className="w-2.5 h-2.5 text-zinc-600" />
+                        <span className="text-[8px] text-zinc-600">
+                          Expires: {new Date(d.expires_at).toLocaleDateString()} {new Date(d.expires_at).toLocaleTimeString()}
+                        </span>
+                      </div>
+                    )}
                   </div>
                 ))}
 
                 {/* Grant delegation form */}
                 {showGrantForm ? (
-                  <div className="rounded-lg bg-[#0a0a0f] border border-[#C19A5B]/20 p-3 space-y-2">
-                    <p className="text-[10px] text-zinc-400 font-medium">Grant scopes to {selectedAgent}</p>
-                    <div className="flex flex-wrap gap-1.5">
-                      {DELEGATION_SCOPES.map(scope => (
-                        <button key={scope}
-                          onClick={() => setGrantScopes(prev =>
-                            prev.includes(scope) ? prev.filter(s => s !== scope) : [...prev, scope]
-                          )}
-                          className={cn(
-                            "text-[9px] px-1.5 py-0.5 rounded-full border transition-colors",
-                            grantScopes.includes(scope)
-                              ? 'bg-[#C19A5B]/15 text-[#C19A5B] border-[#C19A5B]/30'
-                              : 'bg-zinc-800/50 text-zinc-500 border-zinc-700 hover:border-zinc-500'
-                          )}>
-                          {scope}
-                        </button>
-                      ))}
+                  <div className="rounded-lg bg-[#0a0a0f] border border-[#C19A5B]/20 p-3 space-y-3">
+                    <p className="text-[10px] text-zinc-400 font-medium">Grant delegation to {selectedAgent}</p>
+
+                    {/* Scopes */}
+                    <div>
+                      <label className="text-[9px] text-zinc-600 uppercase tracking-wider mb-1 block">Scopes</label>
+                      <div className="flex flex-wrap gap-1.5">
+                        {DEFAULT_SCOPES.map(scope => (
+                          <button key={scope}
+                            onClick={() => setGrantScopes(prev =>
+                              prev.includes(scope) ? prev.filter(s => s !== scope) : [...prev, scope]
+                            )}
+                            className={cn(
+                              "text-[9px] px-1.5 py-0.5 rounded-full border transition-colors",
+                              grantScopes.includes(scope)
+                                ? 'bg-[#C19A5B]/15 text-[#C19A5B] border-[#C19A5B]/30'
+                                : 'bg-zinc-800/50 text-zinc-500 border-zinc-700 hover:border-zinc-500'
+                            )}>
+                            {scope}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="flex gap-1.5 mt-1.5">
+                        <input
+                          value={grantCustomScope}
+                          onChange={e => setGrantCustomScope(e.target.value)}
+                          placeholder="Custom scope..."
+                          className="flex-1 px-2 py-1 text-[9px] bg-[#0a0a0a] border border-white/10 rounded text-zinc-300 placeholder-zinc-700 focus:border-[#C5A572]/50 focus:outline-none"
+                          onKeyDown={e => {
+                            if (e.key === 'Enter' && grantCustomScope.trim()) {
+                              setGrantScopes(prev => prev.includes(grantCustomScope.trim()) ? prev : [...prev, grantCustomScope.trim()]);
+                              setGrantCustomScope('');
+                            }
+                          }}
+                        />
+                        <button
+                          onClick={() => {
+                            if (grantCustomScope.trim()) {
+                              setGrantScopes(prev => prev.includes(grantCustomScope.trim()) ? prev : [...prev, grantCustomScope.trim()]);
+                              setGrantCustomScope('');
+                            }
+                          }}
+                          className="px-1.5 py-1 text-[9px] rounded bg-zinc-800 text-zinc-400 hover:text-zinc-200"
+                        >Add</button>
+                      </div>
                     </div>
+
+                    {/* Expiry */}
+                    <div>
+                      <label className="text-[9px] text-zinc-600 uppercase tracking-wider mb-1 block">Expiry</label>
+                      <div className="flex flex-wrap gap-1.5">
+                        {EXPIRY_OPTIONS.map(opt => (
+                          <button key={opt.value}
+                            onClick={() => setGrantExpiry(opt.value)}
+                            className={cn(
+                              "text-[9px] px-1.5 py-0.5 rounded-full border transition-colors",
+                              grantExpiry === opt.value
+                                ? 'bg-blue-500/15 text-blue-400 border-blue-500/30'
+                                : 'bg-zinc-800/50 text-zinc-500 border-zinc-700 hover:border-zinc-500'
+                            )}>
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Caveats */}
+                    <div>
+                      <label className="text-[9px] text-zinc-600 uppercase tracking-wider mb-1 block">Caveats (optional)</label>
+                      <div className="space-y-1.5">
+                        <input
+                          value={grantMaxCost}
+                          onChange={e => setGrantMaxCost(e.target.value)}
+                          placeholder="Max cost (e.g. 10.00)"
+                          type="number"
+                          step="0.01"
+                          className="w-full px-2 py-1 text-[9px] bg-[#0a0a0a] border border-white/10 rounded text-zinc-300 placeholder-zinc-700 focus:border-[#C5A572]/50 focus:outline-none"
+                        />
+                        <input
+                          value={grantResources}
+                          onChange={e => setGrantResources(e.target.value)}
+                          placeholder="Resource restrictions (comma-separated, e.g. entities/*, memory/*)"
+                          className="w-full px-2 py-1 text-[9px] bg-[#0a0a0a] border border-white/10 rounded text-zinc-300 placeholder-zinc-700 focus:border-[#C5A572]/50 focus:outline-none"
+                        />
+                      </div>
+                    </div>
+
                     <div className="flex gap-2 pt-1">
                       <button onClick={handleGrantDelegation}
                         disabled={grantScopes.length === 0 || actionLoading}
@@ -1016,7 +1207,7 @@ export const Observatory: React.FC = () => {
                         {actionLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
                         Grant
                       </button>
-                      <button onClick={() => { setShowGrantForm(false); setGrantScopes([]); }}
+                      <button onClick={() => { setShowGrantForm(false); setGrantScopes([]); setGrantCustomScope(''); setGrantExpiry(0); setGrantMaxCost(''); setGrantResources(''); }}
                         className="px-2.5 py-1 rounded-md text-zinc-500 text-[10px] hover:text-zinc-300">
                         Cancel
                       </button>
@@ -1057,6 +1248,13 @@ export const Observatory: React.FC = () => {
 
                 {showTaskForm ? (
                   <div className="rounded-lg bg-[#0a0a0f] border border-[#C19A5B]/20 p-3 space-y-2">
+                    <select value={taskAssignee || selectedAgent || ''}
+                      onChange={e => setTaskAssignee(e.target.value)}
+                      className="w-full px-2 py-1.5 text-[10px] bg-[#0a0a0a] border border-white/10 rounded text-zinc-400 focus:outline-none">
+                      {agents.map(a => (
+                        <option key={a.name} value={a.name}>{a.name}</option>
+                      ))}
+                    </select>
                     <input value={taskTitle} onChange={e => setTaskTitle(e.target.value)}
                       placeholder="Task title"
                       className="w-full px-2 py-1.5 text-[10px] bg-[#0a0a0a] border border-white/10 rounded text-zinc-300 focus:border-[#C5A572]/50 focus:outline-none" />
@@ -1078,7 +1276,7 @@ export const Observatory: React.FC = () => {
                         {actionLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Send className="w-3 h-3" />}
                         Assign
                       </button>
-                      <button onClick={() => { setShowTaskForm(false); setTaskTitle(''); setTaskContent(''); }}
+                      <button onClick={() => { setShowTaskForm(false); setTaskTitle(''); setTaskContent(''); setTaskAssignee(''); }}
                         className="px-2.5 py-1 rounded-md text-zinc-500 text-[10px] hover:text-zinc-300">
                         Cancel
                       </button>
@@ -1148,27 +1346,100 @@ export const Observatory: React.FC = () => {
                 )}
               </Section>
 
-              {/* Outcomes */}
-              {selectedOutcomes.length > 0 && (
-                <Section icon={TrendingUp} title={`Outcomes (${selectedOutcomes.length})`}>
-                  {selectedOutcomes.slice(0, 10).map(o => (
-                    <div key={o.id} className="flex items-start gap-2 py-1.5 px-2.5 rounded bg-[#0a0a0f] border border-white/5">
-                      {outcomeIcon(o.metadata?.result ?? '')}
-                      <div className="flex-1 min-w-0">
-                        <div className="text-[10px] text-zinc-300 truncate">{o.title}</div>
-                        <div className="text-[9px] text-zinc-600 mt-0.5 truncate">{o.content}</div>
-                      </div>
-                      {o.metadata?.reward_signal !== undefined && (
-                        <span className={cn("text-[9px] font-mono shrink-0",
-                          o.metadata.reward_signal >= 0 ? 'text-emerald-400' : 'text-red-400'
-                        )}>
-                          {o.metadata.reward_signal >= 0 ? '+' : ''}{o.metadata.reward_signal.toFixed(1)}
-                        </span>
-                      )}
+              {/* In-Context RL */}
+              <Section icon={BarChart3} title="In-Context RL">
+                {recallData && recallData.summary.total_outcomes > 0 ? (
+                  <div className="space-y-3">
+                    {/* RL Loop Diagram */}
+                    <div className="rounded-lg bg-[#0a0a0f] border border-white/5 p-2">
+                      <RLLoopDiagram trend={recallData.summary.recent_trend} />
                     </div>
-                  ))}
-                </Section>
-              )}
+
+                    {/* Summary Stats */}
+                    <div className="grid grid-cols-3 gap-2">
+                      {[
+                        { label: 'Success', value: recallData.summary.success_rate !== null ? `${(recallData.summary.success_rate * 100).toFixed(0)}%` : '-', color: 'text-emerald-400' },
+                        { label: 'Avg Reward', value: recallData.summary.avg_reward !== null ? recallData.summary.avg_reward.toFixed(2) : '-', color: 'text-[#C19A5B]' },
+                        { label: 'Outcomes', value: String(recallData.summary.total_outcomes), color: 'text-zinc-300' },
+                      ].map(s => (
+                        <div key={s.label} className="rounded bg-[#0a0a0f] border border-white/5 px-2 py-1.5 text-center">
+                          <div className={cn("text-sm font-bold font-mono", s.color)}>{s.value}</div>
+                          <div className="text-[8px] text-zinc-600 mt-0.5">{s.label}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Learning Curve */}
+                    {trendData && trendData.points.length > 1 && (
+                      <div className="rounded-lg bg-[#0a0a0f] border border-white/5 p-2">
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-[9px] text-zinc-500 font-medium">Reward Signal</span>
+                          <div className="flex gap-1">
+                            {['24h', '7d', '30d'].map(w => (
+                              <button key={w} onClick={() => setTrendWindow(w)}
+                                className={cn("text-[8px] px-1.5 py-0.5 rounded",
+                                  trendWindow === w ? 'bg-[#C19A5B]/15 text-[#C19A5B]' : 'text-zinc-600 hover:text-zinc-400'
+                                )}>{w}</button>
+                            ))}
+                          </div>
+                        </div>
+                        <LearningCurve points={trendData.points} />
+                      </div>
+                    )}
+
+                    {/* Top Actions */}
+                    {(recallData.summary.top_success_actions.length > 0 || recallData.summary.top_failure_actions.length > 0) && (
+                      <div className="flex gap-3">
+                        {recallData.summary.top_success_actions.length > 0 && (
+                          <div className="flex-1">
+                            <div className="text-[8px] text-zinc-600 mb-1">Strong at</div>
+                            <div className="flex flex-wrap gap-1">
+                              {recallData.summary.top_success_actions.map(a => (
+                                <span key={a} className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">{a}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {recallData.summary.top_failure_actions.length > 0 && (
+                          <div className="flex-1">
+                            <div className="text-[8px] text-zinc-600 mb-1">Weak at</div>
+                            <div className="flex flex-wrap gap-1">
+                              {recallData.summary.top_failure_actions.map(a => (
+                                <span key={a} className="text-[9px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20">{a}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Recent Outcomes */}
+                    <div>
+                      <div className="text-[8px] text-zinc-600 mb-1.5">Recent</div>
+                      {recallData.entries.slice(0, 6).map(o => (
+                        <div key={o.id} className="flex items-start gap-2 py-1.5 px-2.5 rounded bg-[#0a0a0f] border border-white/5 mb-1">
+                          {outcomeIcon(o.metadata?.result ?? '')}
+                          <div className="flex-1 min-w-0">
+                            <div className="text-[10px] text-zinc-300 truncate">{o.title}</div>
+                            <div className="text-[9px] text-zinc-600 mt-0.5 truncate">{o.content}</div>
+                          </div>
+                          {o.metadata?.reward_signal !== undefined && (
+                            <span className={cn("text-[9px] font-mono shrink-0",
+                              o.metadata.reward_signal >= 0 ? 'text-emerald-400' : 'text-red-400'
+                            )}>
+                              {o.metadata.reward_signal >= 0 ? '+' : ''}{o.metadata.reward_signal.toFixed(1)}
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-[10px] text-zinc-600 py-2">
+                    {selected?.did ? 'No outcomes recorded yet' : 'Agent has no DID - register with a DID to enable RL'}
+                  </div>
+                )}
+              </Section>
 
               {/* Provenance */}
               {selectedProvenance.length > 0 && (
@@ -1188,6 +1459,135 @@ export const Observatory: React.FC = () => {
           </div>
         )}
       </div>
+    </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Learning Curve Chart (SVG)
+// ---------------------------------------------------------------------------
+
+const LearningCurve: React.FC<{
+  points: TrendPoint[];
+  width?: number;
+  height?: number;
+}> = ({ points, width = 300, height = 100 }) => {
+  if (points.length === 0) {
+    return (
+      <div className="flex items-center justify-center h-20 text-[10px] text-zinc-600">
+        No outcome data yet
+      </div>
+    );
+  }
+
+  const pad = { top: 8, right: 8, bottom: 20, left: 28 };
+  const w = width - pad.left - pad.right;
+  const h = height - pad.top - pad.bottom;
+
+  // Reward values (0-1 scale, default 0.5 for null)
+  const values = points.map(p => p.avg_reward ?? 0.5);
+  const minV = 0;
+  const maxV = 1;
+
+  const x = (i: number) => pad.left + (points.length === 1 ? w / 2 : (i / (points.length - 1)) * w);
+  const y = (v: number) => pad.top + h - ((v - minV) / (maxV - minV)) * h;
+
+  // Line path
+  const linePath = values.map((v, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+
+  // Area path (filled below line)
+  const areaPath = `${linePath} L${x(values.length - 1).toFixed(1)},${y(0).toFixed(1)} L${x(0).toFixed(1)},${y(0).toFixed(1)} Z`;
+
+  // X-axis labels (first, middle, last)
+  const formatTime = (t: string) => {
+    const d = new Date(t);
+    return `${d.getMonth() + 1}/${d.getDate()}`;
+  };
+
+  return (
+    <svg width={width} height={height} className="w-full" viewBox={`0 0 ${width} ${height}`}>
+      {/* Grid lines */}
+      {[0, 0.25, 0.5, 0.75, 1].map(v => (
+        <g key={v}>
+          <line x1={pad.left} y1={y(v)} x2={width - pad.right} y2={y(v)}
+            stroke="rgba(255,255,255,0.04)" strokeWidth="1" />
+          <text x={pad.left - 4} y={y(v) + 3} textAnchor="end"
+            className="fill-zinc-600" style={{ fontSize: '8px' }}>{v.toFixed(1)}</text>
+        </g>
+      ))}
+
+      {/* Area fill */}
+      <path d={areaPath} fill="url(#rewardGradient)" />
+      <defs>
+        <linearGradient id="rewardGradient" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#C19A5B" stopOpacity="0.2" />
+          <stop offset="100%" stopColor="#C19A5B" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+
+      {/* Line */}
+      <path d={linePath} fill="none" stroke="#C19A5B" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+
+      {/* Points */}
+      {values.map((v, i) => (
+        <circle key={i} cx={x(i)} cy={y(v)} r="2.5"
+          fill="#0a0a0f" stroke="#C19A5B" strokeWidth="1.5" />
+      ))}
+
+      {/* Success/failure bars at bottom */}
+      {points.map((p, i) => {
+        const barW = Math.max(2, w / points.length - 2);
+        const bx = x(i) - barW / 2;
+        const ratio = p.total > 0 ? p.successes / p.total : 0.5;
+        return (
+          <g key={`bar-${i}`}>
+            <rect x={bx} y={height - 12} width={barW * ratio} height={4} rx="1" fill="#34d399" opacity="0.6" />
+            <rect x={bx + barW * ratio} y={height - 12} width={barW * (1 - ratio)} height={4} rx="1" fill="#f87171" opacity="0.4" />
+          </g>
+        );
+      })}
+
+      {/* X-axis time labels */}
+      {points.length > 0 && (
+        <>
+          <text x={x(0)} y={height - 1} textAnchor="start" className="fill-zinc-600" style={{ fontSize: '8px' }}>
+            {formatTime(points[0].time)}
+          </text>
+          {points.length > 2 && (
+            <text x={x(points.length - 1)} y={height - 1} textAnchor="end" className="fill-zinc-600" style={{ fontSize: '8px' }}>
+              {formatTime(points[points.length - 1].time)}
+            </text>
+          )}
+        </>
+      )}
+    </svg>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// RL Loop Diagram
+// ---------------------------------------------------------------------------
+
+const RLLoopDiagram: React.FC<{ trend: 'improving' | 'declining' | 'stable' }> = ({ trend }) => {
+  const trendColor = trend === 'improving' ? 'text-emerald-400' : trend === 'declining' ? 'text-red-400' : 'text-zinc-400';
+  const trendLabel = trend === 'improving' ? 'Learning' : trend === 'declining' ? 'Degrading' : 'Stable';
+
+  return (
+    <div className="flex items-center justify-between px-2 py-2">
+      {[
+        { icon: Zap, label: 'Act', color: 'text-[#C19A5B]' },
+        { icon: Eye, label: 'Outcome', color: 'text-zinc-400' },
+        { icon: Brain, label: 'Memorize', color: 'text-purple-400' },
+        { icon: RotateCw, label: trendLabel, color: trendColor },
+      ].map((step, i) => (
+        <React.Fragment key={i}>
+          {i > 0 && <ArrowRight className="w-3 h-3 text-zinc-700 shrink-0" />}
+          <div className="flex flex-col items-center gap-0.5">
+            <step.icon className={cn("w-3.5 h-3.5", step.color)} />
+            <span className={cn("text-[8px] font-medium", step.color)}>{step.label}</span>
+          </div>
+        </React.Fragment>
+      ))}
     </div>
   );
 };

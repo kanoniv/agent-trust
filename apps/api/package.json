@@ -5,10 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch src/index.js",
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "vitest run"
   },
   "dependencies": {
     "express": "^5.1.0",
     "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.0"
   }
 }
