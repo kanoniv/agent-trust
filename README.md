@@ -1,8 +1,8 @@
 # Agent Trust
 
-**The trust layer for multi-agent systems.**
+**Add one agent that controls every other agent.**
 
-An autonomous agent that verifies, scores, and controls other agents using cryptographic proof.
+An autonomous agent that verifies, scores, and enforces what other agents are allowed to do - using cryptographic proof.
 
 Langfuse can tell you an agent failed. Agent Trust can prove it failed and revoke its permissions before it fails again.
 
@@ -35,6 +35,10 @@ best = trust.select(["researcher", "writer"])  # -> "researcher"
 # Enforce - real authority, not a recommendation
 trust.restrict("writer", scopes=["summarize"])  # limit permissions
 trust.revoke("writer")                           # revoke all access
+
+# Reputation from verified, signed outcomes - not self-reported metrics
+trust.reputation("writer")
+# -> ReputationReport(score=18, success_rate=0.0, trend="declining", current_scopes=[])
 ```
 
 ## Why
@@ -54,7 +58,7 @@ TrustAgent interprets + enforces (reputation, UCB, restrict/revoke)
 - **Identity**: Each agent gets an Ed25519 key pair and a `did:key` identifier
 - **Provenance**: Every action is signed. Tamper-proof audit trail.
 - **Delegation**: Scoped permissions that can be restricted or revoked in real time
-- **Reputation**: Computed from verified outcomes, not self-reported metrics
+- **Reputation**: Computed from verified, signed outcomes - not self-reported metrics or LLM judgment
 - **Routing**: UCB (Upper Confidence Bound) balances exploiting proven agents with exploring under-tested ones
 - **Enforcement**: Restrict scopes or revoke delegation entirely. Not advisory - cryptographic.
 
