@@ -39,8 +39,8 @@ async function recordProvenance(agent, action, entityIds, metadata, subjectDid) 
     await pool.query(
       `INSERT INTO memory (entry_type, slug, title, content, metadata, author, subject_did)
        VALUES ('outcome', $1, $2, $3, $4, $5, $6)`,
-      [slug, `${action}: success`, `Auto-recorded ${action} by ${agent}`,
-       JSON.stringify({ action, result: 'success', reward_signal: 1.0, auto_recorded: true }),
+      [slug, `${action}: completed`, `Auto-recorded ${action} by ${agent}`,
+       JSON.stringify({ action, result: 'completed', auto_recorded: true }),
        `agent:${agent}`, subjectDid || null]
     );
   } catch (e) {
@@ -301,6 +301,42 @@ app.put('/v1/memory/:id', async (req, res) => {
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });
     res.json(result.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Feedback - the real reward signal (quality, not just activity)
+// ---------------------------------------------------------------------------
+app.post('/v1/memory/feedback', async (req, res) => {
+  const { subject_did, action, result, reward_signal, content } = req.body;
+  if (!subject_did) return res.status(400).json({ error: 'subject_did required' });
+  if (result && !['success', 'failure', 'partial'].includes(result)) {
+    return res.status(400).json({ error: 'result must be success, failure, or partial' });
+  }
+  if (reward_signal !== undefined && (typeof reward_signal !== 'number' || reward_signal < -1 || reward_signal > 1)) {
+    return res.status(400).json({ error: 'reward_signal must be a number between -1 and 1' });
+  }
+
+  const agent = agentName(req);
+  const slug = `feedback-${action || 'general'}-${Date.now()}`;
+  const title = `${action || 'feedback'}: ${result || 'rated'}`;
+  const meta = {
+    action: action || 'feedback',
+    result: result || 'rated',
+    ...(reward_signal !== undefined ? { reward_signal } : {}),
+    feedback: true,
+    reported_by: agent,
+  };
+
+  try {
+    const row = await pool.query(
+      `INSERT INTO memory (entry_type, slug, title, content, metadata, author, subject_did)
+       VALUES ('outcome', $1, $2, $3, $4, $5, $6) RETURNING *`,
+      [slug, title, content || '', JSON.stringify(meta), `agent:${agent}`, subject_did]
+    );
+    res.json(row.rows[0]);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

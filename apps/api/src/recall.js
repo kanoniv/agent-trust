@@ -9,6 +9,7 @@ export function computeRecallSummary(rows) {
   const outcomes = rows.filter(r => r.entry_type === 'outcome');
   const successes = outcomes.filter(r => r.metadata?.result === 'success').length;
   const failures = outcomes.filter(r => r.metadata?.result === 'failure').length;
+  const judged = successes + failures; // only outcomes with a real verdict
   const rewards = outcomes.map(r => r.metadata?.reward_signal).filter(r => typeof r === 'number');
   const avgReward = rewards.length > 0 ? rewards.reduce((a, b) => a + b, 0) / rewards.length : null;
 
@@ -41,9 +42,10 @@ export function computeRecallSummary(rows) {
 
   return {
     total_outcomes: outcomes.length,
+    judged,
     successes,
     failures,
-    success_rate: outcomes.length > 0 ? successes / outcomes.length : null,
+    success_rate: judged > 0 ? successes / judged : null,
     avg_reward: avgReward,
     recent_trend: recentTrend,
     top_success_actions: topSuccessActions,

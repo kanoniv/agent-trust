@@ -205,8 +205,56 @@ describe('computeRecallSummary', () => {
     expect(s.total_outcomes).toBe(2);
     expect(s.successes).toBe(1);
     expect(s.failures).toBe(0);
-    // success_rate counts success / total, so partial counts against success rate
-    expect(s.success_rate).toBe(0.5);
+    expect(s.judged).toBe(1); // only success counts as judged
+    // success_rate is success / judged, not total
+    expect(s.success_rate).toBe(1.0);
+  });
+
+  // --- Auto-provenance (completed) vs feedback (success/failure) ---
+  it('completed outcomes count as activity but not judged', () => {
+    const rows = [
+      { entry_type: 'outcome', metadata: { action: 'delegate', result: 'completed', auto_recorded: true } },
+      { entry_type: 'outcome', metadata: { action: 'delegate', result: 'completed', auto_recorded: true } },
+      { entry_type: 'outcome', metadata: { action: 'delegate', result: 'completed', auto_recorded: true } },
+    ];
+    const s = computeRecallSummary(rows);
+    expect(s.total_outcomes).toBe(3);
+    expect(s.judged).toBe(0);
+    expect(s.successes).toBe(0);
+    expect(s.failures).toBe(0);
+    expect(s.success_rate).toBeNull(); // no judged outcomes
+    expect(s.avg_reward).toBeNull(); // no reward signals
+  });
+
+  it('mixes completed (auto) with feedback (judged) correctly', () => {
+    const rows = [
+      // 3 auto-recorded completions (no reward)
+      { entry_type: 'outcome', metadata: { action: 'delegate', result: 'completed', auto_recorded: true } },
+      { entry_type: 'outcome', metadata: { action: 'delegate', result: 'completed', auto_recorded: true } },
+      { entry_type: 'outcome', metadata: { action: 'delegate', result: 'completed', auto_recorded: true } },
+      // 2 feedback entries (real signal)
+      outcome('delegate', 'success', 0.9),
+      outcome('delegate', 'failure', 0.2),
+    ];
+    const s = computeRecallSummary(rows);
+    expect(s.total_outcomes).toBe(5);
+    expect(s.judged).toBe(2); // only feedback counted
+    expect(s.successes).toBe(1);
+    expect(s.failures).toBe(1);
+    expect(s.success_rate).toBe(0.5); // 1 success / 2 judged
+    expect(s.avg_reward).toBe(0.55); // (0.9 + 0.2) / 2
+  });
+
+  it('success_rate ignores completed when mixed with verdicts', () => {
+    const rows = [
+      { entry_type: 'outcome', metadata: { action: 'search', result: 'completed' } },
+      { entry_type: 'outcome', metadata: { action: 'search', result: 'completed' } },
+      outcome('search', 'success', 0.8),
+    ];
+    const s = computeRecallSummary(rows);
+    expect(s.total_outcomes).toBe(3);
+    expect(s.judged).toBe(1);
+    expect(s.success_rate).toBe(1.0); // 1/1 judged, not 1/3 total
   });
 });
 
