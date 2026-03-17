@@ -247,6 +247,7 @@ interface MemoryEntry {
 
 interface RecallSummary {
   total_outcomes: number;
+  judged: number;
   successes: number;
   failures: number;
   success_rate: number | null;
