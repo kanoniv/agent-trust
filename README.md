@@ -148,7 +148,7 @@ rep.current_scopes   # ["search", "analyze"]
 
 ## Portable Agent Identity
 
-Agents own their keys. Generate once, save to disk, load on any service. Works across distributed systems.
+Agents own their keys. Generate once, save to disk, load on any service. Works across distributed systems. Agent Trust implements [`did:agent`](https://github.com/w3c/did-extensions/pull/681), our proposed W3C DID method for AI agent identity.
 
 ```python
 from agent_trust import AgentIdentity
