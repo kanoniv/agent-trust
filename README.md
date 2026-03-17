@@ -10,7 +10,7 @@ Langfuse can tell you an agent failed. Agent Trust can prove it failed and revok
 pip install kanoniv-trust
 ```
 
-![Agent Trust Observatory](docs/demo.gif)
+![Agent Trust Observatory](docs/observatory.png)
 
 ## 5 Lines of Code
 
