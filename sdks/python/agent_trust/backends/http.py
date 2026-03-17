@@ -200,11 +200,18 @@ class HttpBackend:
     # -- Delegations --
 
     def grant_delegation(
-        self, grantor: str, agent: str, scopes: list[str]
+        self, grantor: str, agent: str, scopes: list[str],
+        caveats: dict | None = None, expires_at: float | None = None,
     ) -> Delegation:
+        body: dict = {"agent_name": agent, "scopes": scopes}
+        if caveats:
+            body["metadata"] = caveats
+        if expires_at is not None:
+            from datetime import datetime, timezone
+            body["expires_at"] = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
         r = self._client.post(
             "/v1/delegations",
-            json={"agent_name": agent, "scopes": scopes},
+            json=body,
             headers=self._headers(grantor),
         )
         r.raise_for_status()
@@ -213,6 +220,8 @@ class HttpBackend:
             grantor=grantor,
             agent=agent,
             scopes=scopes,
+            caveats=caveats or {},
+            expires_at=expires_at,
             created_at=_parse_ts(data.get("created_at")),
         )
 

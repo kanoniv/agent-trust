@@ -45,6 +45,8 @@ class Delegation:
     grantor: str  # who granted
     agent: str  # who received
     scopes: list[str] = field(default_factory=list)
+    caveats: dict = field(default_factory=dict)  # e.g. {"max_cost": 100, "resource": "docs/*"}
+    expires_at: float | None = None  # unix timestamp, None = never expires
     revoked: bool = False
     created_at: float = 0.0
 
@@ -91,7 +93,8 @@ class Backend(Protocol):
 
     # Delegations
     def grant_delegation(
-        self, grantor: str, agent: str, scopes: list[str]
+        self, grantor: str, agent: str, scopes: list[str],
+        caveats: dict | None = None, expires_at: float | None = None,
     ) -> Delegation: ...
 
     def revoke_delegation(self, grantor: str, agent: str) -> Delegation | None: ...

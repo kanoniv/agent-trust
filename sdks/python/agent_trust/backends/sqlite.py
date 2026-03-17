@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS delegations (
     grantor TEXT NOT NULL,
     agent TEXT NOT NULL REFERENCES agents(name),
     scopes TEXT NOT NULL DEFAULT '[]',
+    caveats TEXT NOT NULL DEFAULT '{}',
+    expires_at REAL,
     revoked INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL
 );
@@ -187,7 +189,8 @@ class SQLiteBackend:
     # -- Delegations --
 
     def grant_delegation(
-        self, grantor: str, agent: str, scopes: list[str]
+        self, grantor: str, agent: str, scopes: list[str],
+        caveats: dict | None = None, expires_at: float | None = None,
     ) -> Delegation:
         now = time.time()
         # Revoke any existing active delegation from this grantor
@@ -196,11 +199,14 @@ class SQLiteBackend:
             [grantor, agent],
         )
         self._conn.execute(
-            "INSERT INTO delegations (grantor, agent, scopes, created_at) VALUES (?, ?, ?, ?)",
-            [grantor, agent, json.dumps(scopes), now],
+            "INSERT INTO delegations (grantor, agent, scopes, caveats, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [grantor, agent, json.dumps(scopes), json.dumps(caveats or {}), expires_at, now],
         )
         self._conn.commit()
-        return Delegation(grantor=grantor, agent=agent, scopes=scopes, created_at=now)
+        return Delegation(
+            grantor=grantor, agent=agent, scopes=scopes,
+            caveats=caveats or {}, expires_at=expires_at, created_at=now,
+        )
 
     def revoke_delegation(self, grantor: str, agent: str) -> Delegation | None:
         row = self._conn.execute(
@@ -217,6 +223,8 @@ class SQLiteBackend:
         return Delegation(
             grantor=grantor, agent=agent,
             scopes=json.loads(row["scopes"]),
+            caveats=json.loads(row["caveats"]),
+            expires_at=row["expires_at"],
             revoked=True, created_at=row["created_at"],
         )
 
@@ -235,7 +243,10 @@ class SQLiteBackend:
         )
         self._conn.commit()
         return Delegation(
-            grantor=grantor, agent=agent, scopes=scopes, created_at=row["created_at"],
+            grantor=grantor, agent=agent, scopes=scopes,
+            caveats=json.loads(row["caveats"]),
+            expires_at=row["expires_at"],
+            created_at=row["created_at"],
         )
 
     def get_delegations(self, agent: str) -> list[Delegation]:
@@ -247,6 +258,8 @@ class SQLiteBackend:
             Delegation(
                 grantor=row["grantor"], agent=row["agent"],
                 scopes=json.loads(row["scopes"]),
+                caveats=json.loads(row["caveats"]),
+                expires_at=row["expires_at"],
                 revoked=bool(row["revoked"]), created_at=row["created_at"],
             )
             for row in rows
@@ -259,13 +272,17 @@ class SQLiteBackend:
         return self._row_to_agent(row)
 
     def _row_to_agent(self, row: sqlite3.Row) -> AgentRecord:
-        # Compute current scopes from active delegations
+        # Compute current scopes from active, non-expired delegations
+        now = time.time()
         deleg_rows = self._conn.execute(
-            "SELECT scopes FROM delegations WHERE agent = ? AND revoked = 0",
+            "SELECT scopes, expires_at FROM delegations WHERE agent = ? AND revoked = 0",
             [row["name"]],
         ).fetchall()
         all_scopes: list[str] = []
         for d in deleg_rows:
+            expires = d["expires_at"]
+            if expires is not None and expires < now:
+                continue  # expired
             all_scopes.extend(json.loads(d["scopes"]))
         return AgentRecord(
             name=row["name"],

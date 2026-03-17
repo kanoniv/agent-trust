@@ -15,8 +15,8 @@ Usage:
     trust.register("writer", capabilities=["write"])
 
     # Grant scoped delegation - cryptographic, not advisory
-    trust.delegate("researcher", scopes=["search", "analyze"])
-    trust.delegate("writer", scopes=["write", "summarize"])
+    trust.delegate("researcher", scopes=["search"])
+    trust.delegate("writer", scopes=["write"])
 
     # Observe a signed action and score it
     trust.observe("researcher", action="search", result="success", reward=0.9)
@@ -178,11 +178,23 @@ class TrustAgent:
     # delegate - grant scoped authority (cryptographic, not advisory)
     # -----------------------------------------------------------------
 
-    def delegate(self, agent: str, scopes: list[str]) -> Delegation:
+    def delegate(
+        self,
+        agent: str,
+        scopes: list[str],
+        caveats: dict | None = None,
+        expires_in: float | None = None,
+    ) -> Delegation:
         """Grant scoped delegation to an agent. Signed by the TrustAgent.
 
         Scopes must be a subset of the agent's registered capabilities.
         You can't delegate what the agent can't do.
+
+        Args:
+            agent: The agent receiving delegation
+            scopes: Permissions to grant (must be subset of capabilities)
+            caveats: Conditions on the delegation, e.g. {"max_cost": 100}
+            expires_in: Seconds until delegation expires. None = never expires.
 
         Raises ValueError if any scope is not in the agent's capabilities.
         """
@@ -195,11 +207,19 @@ class TrustAgent:
                 f"Scopes {invalid} not in {agent}'s capabilities {record.capabilities}. "
                 f"Register the agent with these capabilities first."
             )
-        delegation = self._backend.grant_delegation(self._name, agent, scopes)
+        expires_at = (time.time() + expires_in) if expires_in is not None else None
+        delegation = self._backend.grant_delegation(
+            self._name, agent, scopes, caveats=caveats, expires_at=expires_at,
+        )
         self._signed_provenance(
             action="delegate",
             entity_ids=[agent],
-            metadata={"scopes": scopes, "grantor": self._name},
+            metadata={
+                "scopes": scopes,
+                "grantor": self._name,
+                "caveats": caveats or {},
+                "expires_at": expires_at,
+            },
         )
         return delegation
 
