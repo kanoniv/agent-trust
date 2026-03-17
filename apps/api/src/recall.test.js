@@ -256,6 +256,63 @@ describe('computeRecallSummary', () => {
     expect(s.judged).toBe(1);
     expect(s.success_rate).toBe(1.0); // 1/1 judged, not 1/3 total
   });
+
+  // --- Feedback with result:'rated' (reward only, no verdict) ---
+  it('rated outcomes contribute to avg_reward but not success_rate', () => {
+    const rows = [
+      { entry_type: 'outcome', metadata: { action: 'feedback', result: 'rated', reward_signal: 0.7, feedback: true } },
+      { entry_type: 'outcome', metadata: { action: 'feedback', result: 'rated', reward_signal: 0.3, feedback: true } },
+    ];
+    const s = computeRecallSummary(rows);
+    expect(s.total_outcomes).toBe(2);
+    expect(s.judged).toBe(0);
+    expect(s.successes).toBe(0);
+    expect(s.failures).toBe(0);
+    expect(s.success_rate).toBeNull();
+    expect(s.avg_reward).toBe(0.5); // reward signals still counted
+  });
+
+  // --- Full realistic scenario: auto + feedback + rated ---
+  it('realistic mix: auto-provenance + feedback + reward-only', () => {
+    const rows = [
+      // Auto-provenance (no signal, no verdict)
+      { entry_type: 'outcome', metadata: { action: 'delegate', result: 'completed', auto_recorded: true } },
+      { entry_type: 'outcome', metadata: { action: 'delegate', result: 'completed', auto_recorded: true } },
+      // Feedback with verdict
+      outcome('delegate', 'success', 0.9),
+      outcome('delegate', 'failure', -0.4),
+      outcome('write', 'failure', -0.8),
+      // Reward-only feedback (no verdict)
+      { entry_type: 'outcome', metadata: { action: 'feedback', result: 'rated', reward_signal: 0.6, feedback: true } },
+    ];
+    const s = computeRecallSummary(rows);
+    expect(s.total_outcomes).toBe(6);
+    expect(s.judged).toBe(3); // 1 success + 2 failures
+    expect(s.successes).toBe(1);
+    expect(s.failures).toBe(2);
+    expect(s.success_rate).toBeCloseTo(1/3); // 1 / 3 judged
+    // avg_reward from 4 entries with signals: (0.9 + -0.4 + -0.8 + 0.6) / 4 = 0.075
+    expect(s.avg_reward).toBeCloseTo(0.075);
+    expect(s.top_failure_actions).toContain('delegate');
+    expect(s.top_failure_actions).toContain('write');
+  });
+
+  // --- judged field correctness on basic cases ---
+  it('judged equals successes + failures in basic case', () => {
+    const rows = [
+      outcome('a', 'success', 1.0),
+      outcome('b', 'success', 0.8),
+      outcome('c', 'failure', 0.1),
+    ];
+    const s = computeRecallSummary(rows);
+    expect(s.judged).toBe(3);
+    expect(s.judged).toBe(s.successes + s.failures);
+  });
+
+  it('judged is 0 when no success or failure outcomes', () => {
+    const s = computeRecallSummary([]);
+    expect(s.judged).toBe(0);
+  });
 });
 
 // =========================================================================
