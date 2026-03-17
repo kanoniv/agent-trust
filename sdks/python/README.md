@@ -5,7 +5,7 @@ Verified trust for multi-agent systems. An autonomous trust agent that verifies,
 **Langfuse can tell you an agent failed. Agent Trust can prove it failed and revoke its permissions before it fails again.**
 
 ```
-pip install agent-trust
+pip install kanoniv-trust
 ```
 
 ## Quick Start
@@ -130,7 +130,7 @@ trust = TrustAgent(url="http://your-agent-trust-api:4100")
 Same API, shared persistence. An agent's reputation follows it across systems.
 
 ```
-pip install agent-trust[hosted]  # adds httpx
+pip install kanoniv-trust[hosted]  # adds httpx
 ```
 
 ## License
