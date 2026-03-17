@@ -109,11 +109,13 @@ class TrustAgent:
 
         self._authority = authority
         self._name = "trust-agent"
+        self._agent_keys: dict[str, KeyPair] = {}
 
         # Register self
         self._backend.register(
             self._name, self._keys.did, ["verify", "score", "enforce"], "Autonomous trust orchestrator"
         )
+        self._agent_keys[self._name] = self._keys
 
     @property
     def did(self) -> str:
@@ -138,15 +140,24 @@ class TrustAgent:
     ) -> AgentRecord:
         """Register an agent with a verified identity.
 
-        If no DID is provided, one is generated. On re-registration (idempotent),
-        the existing DID is preserved - a new DID is only assigned on first call.
+        Generates an Ed25519 key pair and DID for the agent. The TrustAgent
+        holds the keys so actions can be automatically signed.
+
+        On re-registration (idempotent), the existing identity is preserved.
         """
-        # Check if already registered - preserve existing DID
+        # Check if already registered - preserve existing identity
         existing = self._backend.get_agent(name)
-        if existing is not None:
+        if existing is not None and name in self._agent_keys:
             agent_did = existing.did
         else:
-            agent_did = did or generate_keys().did
+            # Generate new keys or use provided DID
+            if did:
+                # External DID - no keys to store (agent signs externally)
+                agent_did = did
+            else:
+                keys = generate_keys()
+                agent_did = keys.did
+                self._agent_keys[name] = keys
 
         record = self._backend.register(
             name, agent_did, capabilities or [], description
@@ -158,6 +169,10 @@ class TrustAgent:
             metadata={"capabilities": capabilities or [], "agent_did": agent_did},
         )
         return record
+
+    def agent_keys(self, name: str) -> KeyPair | None:
+        """Get an agent's key pair. Returns None if agent manages its own keys."""
+        return self._agent_keys.get(name)
 
     # -----------------------------------------------------------------
     # delegate - grant scoped authority (cryptographic, not advisory)
@@ -192,8 +207,11 @@ class TrustAgent:
     ) -> Outcome:
         """Observe an agent's action and record the outcome.
 
-        If a signature is provided, it's verified against the agent's DID.
-        Verified actions carry more weight in reputation scoring.
+        If the agent was registered through this TrustAgent, the action is
+        automatically signed with the agent's Ed25519 keys. If a signature
+        is provided externally, it's verified against the agent's DID.
+
+        Verified actions are tracked in the reputation report.
 
         Args:
             agent: The agent that performed the action
@@ -202,7 +220,7 @@ class TrustAgent:
             reward: -1.0 to 1.0 quality signal
             content: Description of what happened
             signature: Optional Ed25519 signature from the acting agent
-            signed_at: Timestamp the agent used when signing (required if signature is provided)
+            signed_at: Timestamp the agent used when signing (required if signature provided externally)
         """
         if not -1.0 <= reward <= 1.0:
             raise ValueError("reward must be between -1.0 and 1.0")
@@ -212,9 +230,18 @@ class TrustAgent:
         record = self._backend.get_agent(agent)
         agent_did = record.did if record else ""
 
-        # Verify signature if provided
+        # Auto-sign if we hold the agent's keys
         verified = False
-        if signature and agent_did and signed_at is not None:
+        now = time.time()
+        agent_keys = self._agent_keys.get(agent)
+        if agent_keys and not signature:
+            signature = sign_provenance(
+                agent_keys, action, [], {"result": result, "reward": reward}, now
+            )
+            signed_at = now
+            verified = True
+        elif signature and agent_did and signed_at is not None:
+            # Verify externally provided signature
             verified = verify_provenance(
                 did=agent_did,
                 action=action,
