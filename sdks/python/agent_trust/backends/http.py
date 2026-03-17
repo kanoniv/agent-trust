@@ -237,7 +237,7 @@ class HttpBackend:
         )
 
     def revoke_delegation(self, grantor: str, agent: str) -> Delegation | None:
-        # Find active delegation
+        # Find ALL active delegations from this grantor and revoke them all
         r = self._client.get(
             "/v1/delegations",
             params={"agent_name": agent},
@@ -245,31 +245,28 @@ class HttpBackend:
         )
         r.raise_for_status()
         delegations = r.json() if isinstance(r.json(), list) else []
-        target = None
+        last = None
         for d in delegations:
             if d.get("grantor_name") == grantor and d.get("revoked_at") is None:
-                target = d
-                break
-        if not target:
+                self._client.delete(
+                    f"/v1/delegations/{d['id']}",
+                    headers=self._headers(grantor),
+                )
+                last = d
+        if not last:
             return None
-
-        r = self._client.delete(
-            f"/v1/delegations/{target['id']}",
-            headers=self._headers(grantor),
-        )
-        r.raise_for_status()
         return Delegation(
             grantor=grantor,
             agent=agent,
-            scopes=target.get("scopes", []),
+            scopes=last.get("scopes", []),
             revoked=True,
-            created_at=_parse_ts(target.get("created_at")),
+            created_at=_parse_ts(last.get("created_at")),
         )
 
     def restrict_delegation(
         self, grantor: str, agent: str, scopes: list[str]
     ) -> Delegation | None:
-        # Find active delegation
+        # Revoke all existing, then grant new restricted delegation
         r = self._client.get(
             "/v1/delegations",
             params={"agent_name": agent},
@@ -277,26 +274,19 @@ class HttpBackend:
         )
         r.raise_for_status()
         delegations = r.json() if isinstance(r.json(), list) else []
-        target = None
+        found = False
         for d in delegations:
             if d.get("grantor_name") == grantor and d.get("revoked_at") is None:
-                target = d
-                break
-        if not target:
+                self._client.delete(
+                    f"/v1/delegations/{d['id']}",
+                    headers=self._headers(grantor),
+                )
+                found = True
+        if not found:
             return None
 
-        r = self._client.put(
-            f"/v1/delegations/{target['id']}",
-            json={"scopes": scopes},
-            headers=self._headers(grantor),
-        )
-        r.raise_for_status()
-        return Delegation(
-            grantor=grantor,
-            agent=agent,
-            scopes=scopes,
-            created_at=_parse_ts(target.get("created_at")),
-        )
+        # Grant new delegation with restricted scopes
+        return self.grant_delegation(grantor, agent, scopes)
 
     def get_delegations(self, agent: str) -> list[Delegation]:
         r = self._client.get(
