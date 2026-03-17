@@ -21,7 +21,7 @@ function getConnection(): ConnectionConfig {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) return JSON.parse(raw);
   } catch { /* ignore */ }
-  return { apiUrl: '', apiKey: '', agentName: '' };
+  return { apiUrl: 'http://localhost:4100', apiKey: '', agentName: '' };
 }
 
 function saveConnection(config: ConnectionConfig) {
