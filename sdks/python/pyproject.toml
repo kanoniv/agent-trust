@@ -23,6 +23,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 
+[tool.hatch.build.targets.wheel]
+packages = ["agent_trust"]
+
 [project.optional-dependencies]
 hosted = ["httpx>=0.25"]
 crewai = ["crewai>=1.0"]
