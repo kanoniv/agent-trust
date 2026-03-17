@@ -48,6 +48,31 @@ async function recordProvenance(agent, action, entityIds, metadata, subjectDid) 
   }
 }
 
+// Fetch recall context for an agent by name. Returns null if no DID or no outcomes.
+// This is the RL loop closer - callers see the agent's track record automatically.
+async function recallContext(agentNameStr) {
+  try {
+    const agentRow = await pool.query(`SELECT did FROM agents WHERE name = $1`, [agentNameStr]);
+    const did = agentRow.rows[0]?.did;
+    if (!did) return null;
+
+    const result = await pool.query(
+      `SELECT * FROM memory
+       WHERE entry_type = 'outcome'
+         AND (subject_did = $1 OR author = 'agent:' || $2)
+         AND status = 'active'
+       ORDER BY created_at DESC LIMIT 20`,
+      [did, agentNameStr]
+    );
+    if (result.rows.length === 0) return null;
+
+    const summary = computeRecallSummary(result.rows);
+    return { did, summary };
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
@@ -105,7 +130,9 @@ app.get('/v1/agents/:name', async (req, res) => {
   try {
     const result = await pool.query(`SELECT * FROM agents WHERE name = $1`, [req.params.name]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'not found' });
-    res.json(result.rows[0]);
+    const agent = result.rows[0];
+    const context = await recallContext(agent.name);
+    res.json({ ...agent, ...(context ? { rl_context: context } : {}) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -130,7 +157,9 @@ app.post('/v1/delegations', async (req, res) => {
     const delegateeRow = await pool.query(`SELECT did FROM agents WHERE name = $1`, [agent_name]);
     const delegateeDid = delegateeRow.rows[0]?.did || null;
     await recordProvenance(grantor, 'delegate', [], { delegated_to: agent_name, scopes, caveats, expires_at }, delegateeDid);
-    res.json(result.rows[0]);
+    // Attach the delegatee's RL context so the caller sees their track record
+    const context = await recallContext(agent_name);
+    res.json({ ...result.rows[0], ...(context ? { rl_context: context } : {}) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -246,7 +275,13 @@ app.post('/v1/memory', async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
       [entry_type, finalSlug, title, content || '', JSON.stringify(metadata || {}), linked_agents || [], author || 'system', subject_did || null]
     );
-    res.json(result.rows[0]);
+    const row = result.rows[0];
+    // For task assignments, attach the assignee's RL context
+    if (entry_type === 'task' && metadata?.assigned_to) {
+      const context = await recallContext(metadata.assigned_to);
+      if (context) row.rl_context = context;
+    }
+    res.json(row);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
