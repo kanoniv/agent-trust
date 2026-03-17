@@ -142,6 +142,13 @@ Open [http://localhost:4173](http://localhost:4173).
 | `reputation(agent)` | Get full reputation report |
 | `restrict(agent, scopes)` | Limit an agent's permissions |
 | `revoke(agent)` | Revoke all delegation |
+| `recall(agent)` | In-context RL - agent reads its own history |
+| `evaluate(agent, action, output, llm)` | LLM-powered quality judgment (opt-in) |
+| `authorized(agent, scope)` | Check if agent can perform an action |
+
+### See it in action
+
+Open the [interactive demo notebook](examples/demo.ipynb) - covers identity, delegation, caveats, expiry, authorization, observation, in-context RL, LLM evaluation, enforcement, and portable agent identity.
 
 ## Architecture
 
@@ -151,7 +158,7 @@ agent-trust/
   apps/
     api/             # Express API server (Node.js)
     observatory/     # React dashboard (Vite + Tailwind)
-  examples/          # LangGraph multi-agent demo
+  examples/          # Demo notebook + LangGraph multi-agent demo
   db/
     init.sql         # Postgres schema (4 tables)
 ```
