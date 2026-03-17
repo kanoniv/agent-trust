@@ -56,6 +56,26 @@ from agent_trust.backends.base import (
 from agent_trust.backends.sqlite import SQLiteBackend
 
 
+class TrustError(Exception):
+    """Raised when a trust operation is denied."""
+    pass
+
+
+@dataclass
+class RLContext:
+    """In-context learning data for an agent. Inject this into prompts
+    so agents learn from their own verified history."""
+    agent: str
+    success_rate: float | None
+    avg_reward: float | None
+    trend: str
+    total_outcomes: int
+    strengths: list[str]      # actions this agent is good at
+    weaknesses: list[str]     # actions this agent is bad at
+    recent_outcomes: list[dict]  # last N outcomes as dicts for prompt injection
+    guidance: str             # human-readable summary for the agent
+
+
 @dataclass
 class ReputationReport:
     """Reputation computed from verified provenance."""
@@ -200,12 +220,11 @@ class TrustAgent:
         """
         record = self._backend.get_agent(agent)
         if record is None:
-            raise ValueError(f"Agent '{agent}' not found. Call register() first.")
+            raise TrustError(f"Agent '{agent}' not found. Call register() first.")
         invalid = [s for s in scopes if s not in record.capabilities]
         if invalid:
-            raise ValueError(
-                f"Scopes {invalid} not in {agent}'s capabilities {record.capabilities}. "
-                f"Register the agent with these capabilities first."
+            raise TrustError(
+                f"Cannot delegate {invalid} to '{agent}' - not in capabilities {record.capabilities}."
             )
         expires_at = (time.time() + expires_in) if expires_in is not None else None
         delegation = self._backend.grant_delegation(
@@ -393,7 +412,7 @@ class TrustAgent:
         """
         record = self._backend.get_agent(agent)
         if record is None:
-            raise ValueError(f"Agent '{agent}' not found. Call register() first.")
+            raise TrustError(f"Agent '{agent}' not found. Call register() first.")
 
         outcomes = self._backend.get_outcomes(agent, limit=50)
         provenance = self._backend.get_provenance(agent, limit=50)
@@ -415,6 +434,51 @@ class TrustAgent:
         )
 
     # -----------------------------------------------------------------
+    # recall - in-context RL: agent reads its own history
+    # -----------------------------------------------------------------
+
+    def recall(self, agent: str, last_n: int = 10) -> RLContext:
+        """Recall an agent's learning context from verified outcomes.
+
+        This is the in-context RL primitive. Inject the returned context
+        into the agent's prompt so it can learn from its own history:
+
+            ctx = trust.recall("researcher")
+            prompt = f"Your track record: {ctx.guidance}\\n\\nTask: ..."
+
+        The agent sees what it's good at, what it's bad at, and adjusts.
+        Next outcome gets recorded, and the next recall reflects the update.
+        That's the learning loop - no gradient descent, just structured memory.
+        """
+        outcomes = self._backend.get_outcomes(agent, limit=50)
+        summary = _compute_summary(outcomes)
+
+        recent = [
+            {
+                "action": o.action,
+                "result": o.result,
+                "reward": o.reward,
+                "content": o.content,
+            }
+            for o in outcomes[:last_n]
+        ]
+
+        # Generate human-readable guidance
+        guidance = _generate_guidance(agent, summary, recent)
+
+        return RLContext(
+            agent=agent,
+            success_rate=summary["success_rate"],
+            avg_reward=summary["avg_reward"],
+            trend=summary["trend"],
+            total_outcomes=summary["total"],
+            strengths=summary["top_success"],
+            weaknesses=summary["top_failure"],
+            recent_outcomes=recent,
+            guidance=guidance,
+        )
+
+    # -----------------------------------------------------------------
     # enforce - restrict or revoke delegation
     # -----------------------------------------------------------------
 
@@ -430,8 +494,8 @@ class TrustAgent:
             if record:
                 invalid = [s for s in scopes if s not in record.capabilities]
                 if invalid:
-                    raise ValueError(
-                        f"Scopes {invalid} not in {agent}'s capabilities {record.capabilities}."
+                    raise TrustError(
+                        f"Cannot restrict '{agent}' to {invalid} - not in capabilities {record.capabilities}."
                     )
         result = self._backend.restrict_delegation(self._name, agent, scopes)
         if result:
@@ -560,3 +624,37 @@ def _compute_reputation_score(record: AgentRecord, summary: dict) -> float:
         activity * 0.30 + success * 0.25 + reward * 0.20
         + tenure * 0.15 + diversity * 0.10, 1,
     )
+
+
+def _generate_guidance(agent: str, summary: dict, recent: list[dict]) -> str:
+    """Generate human-readable guidance from outcome history.
+    This goes into the agent's prompt for in-context learning."""
+    if summary["total"] == 0:
+        return f"No prior history for {agent}. This is your first task."
+
+    parts = [f"Track record for {agent}: {summary['total']} outcomes."]
+
+    sr = summary["success_rate"]
+    if sr is not None:
+        parts.append(f"Success rate: {sr:.0%}.")
+
+    ar = summary["avg_reward"]
+    if ar is not None:
+        parts.append(f"Average reward: {ar:.2f}.")
+
+    if summary["trend"] != "stable":
+        parts.append(f"Performance is {summary['trend']}.")
+
+    if summary["top_success"]:
+        parts.append(f"Strong at: {', '.join(summary['top_success'])}.")
+
+    if summary["top_failure"]:
+        parts.append(f"Weak at: {', '.join(summary['top_failure'])}. Avoid or improve on these.")
+
+    # Add recent outcome context
+    failures = [o for o in recent[:5] if o["result"] == "failure"]
+    if failures:
+        fail_actions = [f["action"] for f in failures]
+        parts.append(f"Recent failures: {', '.join(fail_actions)}. Adjust your approach.")
+
+    return " ".join(parts)

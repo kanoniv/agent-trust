@@ -1,7 +1,7 @@
 """Tests for agent-trust SDK - TrustAgent with cryptographic verification."""
 
 import pytest
-from agent_trust import TrustAgent
+from agent_trust import TrustAgent, TrustError
 
 
 @pytest.fixture
@@ -54,11 +54,11 @@ def test_delegate_shows_in_reputation(trust):
 
 def test_delegate_rejects_invalid_scope(trust):
     trust.register("researcher", capabilities=["search"])
-    with pytest.raises(ValueError, match="not in"):
+    with pytest.raises(TrustError, match="Cannot"):
         trust.delegate("researcher", scopes=["deploy"])
 
 def test_delegate_rejects_unregistered_agent(trust):
-    with pytest.raises(ValueError, match="not found"):
+    with pytest.raises(TrustError, match="not found"):
         trust.delegate("ghost", scopes=["search"])
 
 
@@ -156,7 +156,7 @@ def test_reputation_with_outcomes(trust):
     assert rep.success_rate == 0.5
 
 def test_reputation_unknown_agent(trust):
-    with pytest.raises(ValueError, match="not found"):
+    with pytest.raises(TrustError, match="not found"):
         trust.reputation("nonexistent")
 
 def test_reputation_trend(trust):
@@ -461,3 +461,166 @@ def test_select_with_no_outcomes(trust):
     # Both untested, should not crash
     result = trust.select(["a", "b"])
     assert result in ["a", "b"]
+
+
+# -- authorized --
+
+def test_authorized_granted_scope(trust):
+    trust.register("agent", capabilities=["search", "write"])
+    trust.delegate("agent", scopes=["search", "write"])
+    assert trust.authorized("agent", "search") is True
+    assert trust.authorized("agent", "write") is True
+
+def test_authorized_ungrant_scope(trust):
+    trust.register("agent", capabilities=["search", "write"])
+    trust.delegate("agent", scopes=["search"])
+    assert trust.authorized("agent", "search") is True
+    assert trust.authorized("agent", "write") is False
+
+def test_authorized_no_delegation(trust):
+    trust.register("agent", capabilities=["search"])
+    assert trust.authorized("agent", "search") is False
+
+def test_authorized_after_revoke(trust):
+    trust.register("agent", capabilities=["search"])
+    trust.delegate("agent", scopes=["search"])
+    trust.revoke("agent")
+    assert trust.authorized("agent", "search") is False
+
+def test_authorized_after_restrict(trust):
+    trust.register("agent", capabilities=["search", "write"])
+    trust.delegate("agent", scopes=["search", "write"])
+    trust.restrict("agent", scopes=["search"])
+    assert trust.authorized("agent", "search") is True
+    assert trust.authorized("agent", "write") is False
+
+def test_authorized_unregistered_agent(trust):
+    assert trust.authorized("ghost", "anything") is False
+
+
+# -- scope validation --
+
+def test_delegate_rejects_scope_not_in_capabilities(trust):
+    trust.register("agent", capabilities=["search"])
+    with pytest.raises(TrustError, match="Cannot"):
+        trust.delegate("agent", scopes=["search", "deploy"])
+
+def test_restrict_rejects_scope_not_in_capabilities(trust):
+    trust.register("agent", capabilities=["search", "write"])
+    trust.delegate("agent", scopes=["search", "write"])
+    with pytest.raises(TrustError, match="Cannot"):
+        trust.restrict("agent", scopes=["deploy"])
+
+def test_restrict_to_empty_scopes_allowed(trust):
+    trust.register("agent", capabilities=["search"])
+    trust.delegate("agent", scopes=["search"])
+    result = trust.restrict("agent", scopes=[])
+    assert result is not None
+    assert trust.authorized("agent", "search") is False
+
+
+# -- caveats --
+
+def test_delegate_with_caveats(trust):
+    trust.register("agent", capabilities=["spend"])
+    deleg = trust.delegate("agent", scopes=["spend"], caveats={"max_cost": 100})
+    assert deleg.caveats == {"max_cost": 100}
+
+def test_delegate_caveats_stored_and_returned(trust):
+    trust.register("agent", capabilities=["access_db"])
+    trust.delegate("agent", scopes=["access_db"], caveats={"tables": ["users", "orders"], "read_only": True})
+    delegations = trust._backend.get_delegations("agent")
+    assert len(delegations) == 1
+    assert delegations[0].caveats["tables"] == ["users", "orders"]
+    assert delegations[0].caveats["read_only"] is True
+
+def test_delegate_no_caveats_default(trust):
+    trust.register("agent", capabilities=["search"])
+    deleg = trust.delegate("agent", scopes=["search"])
+    assert deleg.caveats == {}
+
+
+# -- expiry --
+
+def test_delegate_with_expiry(trust):
+    trust.register("agent", capabilities=["search"])
+    deleg = trust.delegate("agent", scopes=["search"], expires_in=3600)
+    assert deleg.expires_at is not None
+    assert trust.authorized("agent", "search") is True
+
+def test_delegate_expired_not_authorized(trust):
+    import time
+    trust.register("agent", capabilities=["search"])
+    # Expire immediately
+    trust.delegate("agent", scopes=["search"], expires_in=0.0)
+    time.sleep(0.1)
+    assert trust.authorized("agent", "search") is False
+
+def test_delegate_no_expiry_default(trust):
+    trust.register("agent", capabilities=["search"])
+    deleg = trust.delegate("agent", scopes=["search"])
+    assert deleg.expires_at is None
+
+def test_delegate_expiry_with_caveats(trust):
+    trust.register("agent", capabilities=["spend"])
+    deleg = trust.delegate("agent", scopes=["spend"], caveats={"max_cost": 50}, expires_in=7200)
+    assert deleg.caveats == {"max_cost": 50}
+    assert deleg.expires_at is not None
+
+
+# -- auto-signing --
+
+def test_observe_auto_signs(trust):
+    trust.register("agent", capabilities=["search"])
+    trust.observe("agent", action="search", result="success", reward=0.9)
+    prov = trust._backend.get_provenance("agent")
+    assert len(prov) == 1
+    assert prov[0].signature is not None
+    assert prov[0].verified is True
+
+def test_observe_auto_signs_all_outcomes(trust):
+    trust.register("agent", capabilities=["search"])
+    for i in range(5):
+        trust.observe("agent", action="search", result="success", reward=0.5 + i * 0.1)
+    prov = trust._backend.get_provenance("agent")
+    assert len(prov) == 5
+    assert all(p.verified for p in prov)
+
+def test_observe_no_auto_sign_for_external_did(trust):
+    trust.register("agent", did="did:key:zExternal123")
+    trust.observe("agent", action="search", result="success", reward=0.9)
+    prov = trust._backend.get_provenance("agent")
+    assert len(prov) == 1
+    # No keys stored, so no auto-sign, but also no external signature provided
+    assert prov[0].verified is False
+
+def test_verified_actions_counted_in_reputation(trust):
+    trust.register("agent", capabilities=["search"])
+    trust.observe("agent", action="search", result="success", reward=0.9)
+    trust.observe("agent", action="search", result="success", reward=0.8)
+    rep = trust.reputation("agent")
+    assert rep.verified_actions == 2
+
+
+# -- agent_keys --
+
+def test_agent_keys_returns_keypair(trust):
+    trust.register("agent")
+    keys = trust.agent_keys("agent")
+    assert keys is not None
+    assert keys.did.startswith("did:key:z")
+
+def test_agent_keys_none_for_external_did(trust):
+    trust.register("agent", did="did:key:zExternal123")
+    assert trust.agent_keys("agent") is None
+
+def test_agent_keys_none_for_unknown(trust):
+    assert trust.agent_keys("ghost") is None
+
+def test_agent_keys_sign_and_verify(trust):
+    from agent_trust.crypto import verify_signature
+    trust.register("agent")
+    keys = trust.agent_keys("agent")
+    msg = b"test message"
+    sig = keys.sign(msg)
+    assert verify_signature(keys.did, msg, sig)

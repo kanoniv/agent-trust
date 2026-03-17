@@ -53,7 +53,18 @@ class HttpBackend:
         if r.status_code == 404:
             return None
         r.raise_for_status()
-        return _parse_agent(r.json())
+        agent = _parse_agent(r.json())
+        # Compute active scopes from delegations (API doesn't include them)
+        delegations = self.get_delegations(name)
+        import time
+        now = time.time()
+        all_scopes: list[str] = []
+        for d in delegations:
+            if d.expires_at is not None and d.expires_at < now:
+                continue
+            all_scopes.extend(d.scopes)
+        agent.scopes = list(set(all_scopes))
+        return agent
 
     # -- Provenance --
 
