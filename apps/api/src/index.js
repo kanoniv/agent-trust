@@ -43,6 +43,9 @@ async function recordProvenance(agent, action, entityIds, metadata, subjectDid) 
        JSON.stringify({ action, result: 'completed', auto_recorded: true }),
        `agent:${agent}`, subjectDid || null]
     );
+    // Update reputation for both acting agent and subject
+    if (agentDid) updateReputation(agentDid);
+    if (subjectDid && subjectDid !== agentDid) updateReputation(subjectDid);
   } catch (e) {
     console.error('Auto-provenance failed:', e.message);
   }
@@ -70,6 +73,73 @@ async function recallContext(agentNameStr) {
     return { did, summary };
   } catch {
     return null;
+  }
+}
+
+// Recompute an agent's reputation from their actual outcomes and update the DB.
+// Called after feedback is submitted so the leaderboard stays current.
+async function updateReputation(agentDid) {
+  try {
+    // Find the agent by DID
+    const agentRow = await pool.query(`SELECT name, registered_at FROM agents WHERE did = $1`, [agentDid]);
+    if (agentRow.rows.length === 0) return;
+    const { name, registered_at } = agentRow.rows[0];
+
+    // Count outcomes
+    const outcomes = await pool.query(
+      `SELECT
+         COUNT(*) AS total,
+         COUNT(*) FILTER (WHERE metadata->>'result' = 'success') AS successes,
+         COUNT(*) FILTER (WHERE metadata->>'result' = 'failure') AS failures,
+         AVG((metadata->>'reward_signal')::float) FILTER (WHERE metadata->>'reward_signal' IS NOT NULL) AS avg_reward,
+         COUNT(DISTINCT metadata->>'action') AS action_types
+       FROM memory
+       WHERE entry_type = 'outcome'
+         AND (subject_did = $1 OR author = 'agent:' || $2)
+         AND status = 'active'`,
+      [agentDid, name]
+    );
+    const row = outcomes.rows[0];
+    const total = parseInt(row.total) || 0;
+    const successes = parseInt(row.successes) || 0;
+    const failures = parseInt(row.failures) || 0;
+    const judged = successes + failures;
+    const successRate = judged > 0 ? successes / judged : 1.0;
+    const avgReward = row.avg_reward ? parseFloat(row.avg_reward) : 0;
+    const actionTypes = parseInt(row.action_types) || 0;
+    const tenureDays = Math.floor((Date.now() - new Date(registered_at).getTime()) / 86400000);
+
+    // Composite score (0-100): weighted blend
+    const activityScore = Math.min(100, Math.log2(total + 1) * 15);   // 30% weight
+    const successScore = successRate * 100;                             // 25% weight
+    const rewardScore = ((avgReward + 1) / 2) * 100;                   // 20% weight
+    const tenureScore = Math.min(100, (tenureDays / 90) * 100);        // 15% weight
+    const diversityScore = Math.min(100, (actionTypes / 7) * 100);     // 10% weight
+
+    const composite = Math.round(
+      activityScore * 0.30 +
+      successScore * 0.25 +
+      rewardScore * 0.20 +
+      tenureScore * 0.15 +
+      diversityScore * 0.10
+    );
+
+    const reputation = {
+      composite_score: composite,
+      total_actions: total,
+      success_rate: successRate,
+      tenure_days: tenureDays,
+      action_diversity: actionTypes,
+      feedback_score: avgReward,
+      last_computed_at: new Date().toISOString(),
+    };
+
+    await pool.query(
+      `UPDATE agents SET reputation = $2 WHERE did = $1`,
+      [agentDid, JSON.stringify(reputation)]
+    );
+  } catch (e) {
+    console.error('Reputation update failed:', e.message);
   }
 }
 
@@ -336,6 +406,8 @@ app.post('/v1/memory/feedback', async (req, res) => {
        VALUES ('outcome', $1, $2, $3, $4, $5, $6) RETURNING *`,
       [slug, title, content || '', JSON.stringify(meta), `agent:${agent}`, subject_did]
     );
+    // Recompute the subject agent's reputation so the dashboard updates
+    updateReputation(subject_did);
     res.json(row.rows[0]);
   } catch (e) {
     res.status(500).json({ error: e.message });

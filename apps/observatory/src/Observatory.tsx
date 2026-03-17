@@ -560,6 +560,7 @@ export const Observatory: React.FC = () => {
   const [recallData, setRecallData] = useState<RecallResponse | null>(null);
   const [trendData, setTrendData] = useState<TrendResponse | null>(null);
   const [trendWindow, setTrendWindow] = useState('7d');
+  const [expandedCard, setExpandedCard] = useState<string | null>(null);
 
   const fetchData = useCallback(async () => {
     try {
@@ -1224,28 +1225,48 @@ export const Observatory: React.FC = () => {
 
               {/* Tasks */}
               <Section icon={ClipboardList} title={`Tasks (${selectedTasks.length})`}>
-                {selectedTasks.map(t => (
-                  <div key={t.id} className="flex items-start gap-2 py-1.5 px-2.5 rounded bg-[#0a0a0f] border border-white/5">
-                    <div className="flex-1 min-w-0">
-                      <div className="text-[10px] text-zinc-300 truncate">{t.title}</div>
-                      <div className="flex items-center gap-2 mt-0.5">
-                        <span className={cn("text-[8px] px-1 py-0.5 rounded",
-                          t.metadata?.status === 'done' ? 'bg-emerald-500/10 text-emerald-400' :
-                          t.metadata?.status === 'in_progress' ? 'bg-blue-500/10 text-blue-400' :
-                          'bg-amber-500/10 text-amber-400'
-                        )}>{t.metadata?.status ?? 'open'}</span>
-                        <span className="text-[8px] text-zinc-600">{t.metadata?.priority ?? 'medium'}</span>
+                {selectedTasks.map(t => {
+                  const isExp = expandedCard === `task-${t.id}`;
+                  return (
+                    <div key={t.id}
+                      className={cn("rounded bg-[#0a0a0f] border transition-colors cursor-pointer",
+                        isExp ? 'border-[#C19A5B]/30' : 'border-white/5 hover:border-white/10'
+                      )}
+                      onClick={() => setExpandedCard(isExp ? null : `task-${t.id}`)}>
+                      <div className="flex items-start gap-2 py-1.5 px-2.5">
+                        <ChevronRight className={cn("w-3 h-3 text-zinc-600 transition-transform shrink-0 mt-0.5", isExp && "rotate-90")} />
+                        <div className="flex-1 min-w-0">
+                          <div className={cn("text-[10px] text-zinc-300", !isExp && "truncate")}>{t.title}</div>
+                          <div className="flex items-center gap-2 mt-0.5">
+                            <span className={cn("text-[8px] px-1 py-0.5 rounded",
+                              t.metadata?.status === 'done' ? 'bg-emerald-500/10 text-emerald-400' :
+                              t.metadata?.status === 'in_progress' ? 'bg-blue-500/10 text-blue-400' :
+                              'bg-amber-500/10 text-amber-400'
+                            )}>{t.metadata?.status ?? 'open'}</span>
+                            <span className="text-[8px] text-zinc-600">{t.metadata?.priority ?? 'medium'}</span>
+                          </div>
+                        </div>
+                        {t.metadata?.status !== 'done' && (
+                          <button onClick={(e) => { e.stopPropagation(); handleCompleteTask(t.id); }}
+                            className="p-1 rounded hover:bg-emerald-500/10 text-zinc-600 hover:text-emerald-400 transition-colors shrink-0"
+                            title="Mark done">
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                       </div>
+                      {isExp && (
+                        <div className="px-2.5 pb-2.5 pt-1 border-t border-white/5 ml-5">
+                          {t.content && <p className="text-[9px] text-zinc-400 whitespace-pre-wrap">{t.content}</p>}
+                          <div className="flex flex-wrap items-center gap-2 mt-2 text-[8px] text-zinc-600">
+                            <span>Author: {t.author}</span>
+                            <span>Assigned: {t.metadata?.assigned_to || '-'}</span>
+                            <span>{new Date(t.created_at).toLocaleString()}</span>
+                          </div>
+                        </div>
+                      )}
                     </div>
-                    {t.metadata?.status !== 'done' && (
-                      <button onClick={() => handleCompleteTask(t.id)}
-                        className="p-1 rounded hover:bg-emerald-500/10 text-zinc-600 hover:text-emerald-400 transition-colors"
-                        title="Mark done">
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                  </div>
-                ))}
+                  );
+                })}
 
                 {showTaskForm ? (
                   <div className="rounded-lg bg-[#0a0a0f] border border-[#C19A5B]/20 p-3 space-y-2">
@@ -1293,22 +1314,44 @@ export const Observatory: React.FC = () => {
 
               {/* Memory */}
               <Section icon={Brain} title={`Memory (${selectedMemories.length})`}>
-                {selectedMemories.slice(0, 8).map(m => (
-                  <div key={m.id} className="flex items-start gap-2 py-1.5 px-2.5 rounded bg-[#0a0a0f] border border-white/5">
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-[8px] px-1 py-0.5 rounded bg-zinc-800 text-zinc-500">{m.entry_type}</span>
-                        <span className="text-[10px] text-zinc-300 truncate">{m.title}</span>
+                {selectedMemories.slice(0, 8).map(m => {
+                  const isExp = expandedCard === `mem-${m.id}`;
+                  return (
+                    <div key={m.id}
+                      className={cn("rounded bg-[#0a0a0f] border transition-colors cursor-pointer",
+                        isExp ? 'border-[#C19A5B]/30' : 'border-white/5 hover:border-white/10'
+                      )}
+                      onClick={() => setExpandedCard(isExp ? null : `mem-${m.id}`)}>
+                      <div className="flex items-start gap-2 py-1.5 px-2.5">
+                        <ChevronRight className={cn("w-3 h-3 text-zinc-600 transition-transform shrink-0 mt-0.5", isExp && "rotate-90")} />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[8px] px-1 py-0.5 rounded bg-zinc-800 text-zinc-500">{m.entry_type}</span>
+                            <span className={cn("text-[10px] text-zinc-300", !isExp && "truncate")}>{m.title}</span>
+                          </div>
+                          {!isExp && <div className="text-[9px] text-zinc-600 mt-0.5 truncate">{m.content}</div>}
+                        </div>
+                        <button onClick={(e) => { e.stopPropagation(); handleArchiveMemory(m.id); }}
+                          className="p-1 rounded hover:bg-red-500/10 text-zinc-700 hover:text-red-400 transition-colors shrink-0"
+                          title="Archive">
+                          <Trash2 className="w-3 h-3" />
+                        </button>
                       </div>
-                      <div className="text-[9px] text-zinc-600 mt-0.5 truncate">{m.content}</div>
+                      {isExp && (
+                        <div className="px-2.5 pb-2.5 pt-1 border-t border-white/5 ml-5">
+                          <p className="text-[9px] text-zinc-400 whitespace-pre-wrap">{m.content || '(no content)'}</p>
+                          <div className="flex flex-wrap items-center gap-2 mt-2 text-[8px] text-zinc-600">
+                            <span className={cn("px-1 py-0.5 rounded",
+                              m.status === 'active' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-zinc-800 text-zinc-500'
+                            )}>{m.status}</span>
+                            <span>By: {m.author}</span>
+                            <span>{new Date(m.created_at).toLocaleString()}</span>
+                          </div>
+                        </div>
+                      )}
                     </div>
-                    <button onClick={() => handleArchiveMemory(m.id)}
-                      className="p-1 rounded hover:bg-red-500/10 text-zinc-700 hover:text-red-400 transition-colors shrink-0"
-                      title="Archive">
-                      <Trash2 className="w-3 h-3" />
-                    </button>
-                  </div>
-                ))}
+                  );
+                })}
 
                 {showMemoryForm ? (
                   <div className="rounded-lg bg-[#0a0a0f] border border-[#C19A5B]/20 p-3 space-y-2">
@@ -1417,22 +1460,41 @@ export const Observatory: React.FC = () => {
                     {/* Recent Outcomes */}
                     <div>
                       <div className="text-[8px] text-zinc-600 mb-1.5">Recent</div>
-                      {recallData.entries.slice(0, 6).map(o => (
-                        <div key={o.id} className="flex items-start gap-2 py-1.5 px-2.5 rounded bg-[#0a0a0f] border border-white/5 mb-1">
-                          {outcomeIcon(o.metadata?.result ?? '')}
-                          <div className="flex-1 min-w-0">
-                            <div className="text-[10px] text-zinc-300 truncate">{o.title}</div>
-                            <div className="text-[9px] text-zinc-600 mt-0.5 truncate">{o.content}</div>
+                      {recallData.entries.slice(0, 6).map(o => {
+                        const isExp = expandedCard === `rl-${o.id}`;
+                        return (
+                          <div key={o.id}
+                            className={cn("rounded bg-[#0a0a0f] border mb-1 transition-colors cursor-pointer",
+                              isExp ? 'border-[#C19A5B]/30' : 'border-white/5 hover:border-white/10'
+                            )}
+                            onClick={() => setExpandedCard(isExp ? null : `rl-${o.id}`)}>
+                            <div className="flex items-start gap-2 py-1.5 px-2.5">
+                              {outcomeIcon(o.metadata?.result ?? '')}
+                              <div className="flex-1 min-w-0">
+                                <div className={cn("text-[10px] text-zinc-300", !isExp && "truncate")}>{o.title}</div>
+                                {!isExp && <div className="text-[9px] text-zinc-600 mt-0.5 truncate">{o.content}</div>}
+                              </div>
+                              {o.metadata?.reward_signal !== undefined && (
+                                <span className={cn("text-[9px] font-mono shrink-0",
+                                  o.metadata.reward_signal >= 0 ? 'text-emerald-400' : 'text-red-400'
+                                )}>
+                                  {o.metadata.reward_signal >= 0 ? '+' : ''}{o.metadata.reward_signal.toFixed(1)}
+                                </span>
+                              )}
+                            </div>
+                            {isExp && (
+                              <div className="px-2.5 pb-2.5 pt-1 border-t border-white/5 ml-5">
+                                <p className="text-[9px] text-zinc-400 whitespace-pre-wrap">{o.content || '(no content)'}</p>
+                                <div className="flex flex-wrap items-center gap-2 mt-2 text-[8px] text-zinc-600">
+                                  {o.metadata?.action && <span className="px-1 py-0.5 rounded bg-zinc-800">{o.metadata.action}</span>}
+                                  <span>By: {o.author}</span>
+                                  <span>{new Date(o.created_at).toLocaleString()}</span>
+                                </div>
+                              </div>
+                            )}
                           </div>
-                          {o.metadata?.reward_signal !== undefined && (
-                            <span className={cn("text-[9px] font-mono shrink-0",
-                              o.metadata.reward_signal >= 0 ? 'text-emerald-400' : 'text-red-400'
-                            )}>
-                              {o.metadata.reward_signal >= 0 ? '+' : ''}{o.metadata.reward_signal.toFixed(1)}
-                            </span>
-                          )}
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 ) : (
