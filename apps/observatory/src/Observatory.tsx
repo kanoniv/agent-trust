@@ -766,7 +766,12 @@ export const Observatory: React.FC = () => {
   const selectedProvenance = provenance.filter(p => p.agent_name === selectedAgent);
   const selectedDelegations = delegations.filter(d => d.agent_name === selectedAgent || d.grantor_name === selectedAgent);
   const selectedTasks = tasks.filter(t => t.metadata?.assigned_to === selectedAgent);
-  const selectedMemories = memories.filter(m => m.author === `agent:${selectedAgent}` || m.author === 'observatory');
+  const selectedMemories = memories.filter(m =>
+    m.entry_type !== 'outcome' && m.entry_type !== 'task' &&
+    (m.author === `agent:${selectedAgent}` || m.author === 'observatory' ||
+     (m as any).subject_did === selected?.did ||
+     (m as any).linked_agents?.includes(selectedAgent))
+  );
 
   const onlineCount = agents.filter(a => a.status === 'online').length;
   const avgScore = agents.length > 0
@@ -1314,6 +1319,9 @@ export const Observatory: React.FC = () => {
 
               {/* Memory */}
               <Section icon={Brain} title={`Memory (${selectedMemories.length})`}>
+                {selectedMemories.length === 0 && !showMemoryForm && (
+                  <div className="text-[10px] text-zinc-600 py-1">No knowledge, decisions, or patterns recorded yet.</div>
+                )}
                 {selectedMemories.slice(0, 8).map(m => {
                   const isExp = expandedCard === `mem-${m.id}`;
                   return (
