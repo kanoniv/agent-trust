@@ -37,7 +37,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from agent_trust.crypto import (
     KeyPair,
@@ -476,6 +476,69 @@ class TrustAgent:
             weaknesses=summary["top_failure"],
             recent_outcomes=recent,
             guidance=guidance,
+        )
+
+    # -----------------------------------------------------------------
+    # evaluate - LLM-powered judgment on top of the protocol
+    # -----------------------------------------------------------------
+
+    def evaluate(
+        self,
+        agent: str,
+        action: str,
+        output: str,
+        task: str = "",
+        llm: Any = None,
+    ) -> Outcome:
+        """Evaluate an agent's output using LLM judgment and record the outcome.
+
+        This is the autonomous trust layer - the TrustAgent reasons about quality,
+        not just counts successes. Requires an LLM (any LangChain chat model).
+
+        Without an LLM, use observe() for manual scoring. evaluate() adds
+        subjective quality assessment on top of the cryptographic protocol.
+
+        Args:
+            agent: The agent that produced the output
+            action: What the agent did
+            output: The actual output to evaluate
+            task: The original task (for context)
+            llm: A LangChain chat model (ChatAnthropic, ChatOpenAI, etc.)
+        """
+        if llm is None:
+            raise TrustError("evaluate() requires an LLM. Pass llm=ChatAnthropic(...) or use observe() for manual scoring.")
+
+        prompt = (
+            f"Evaluate this agent's output quality.\n\n"
+            f"AGENT: {agent}\n"
+            f"ACTION: {action}\n"
+            f"TASK: {task}\n"
+            f"OUTPUT: {output[:2000]}\n\n"
+            f"Rate 0.0 to 1.0. Respond with ONLY JSON: "
+            f'{{\"score\": 0.0-1.0, \"result\": \"success\" or \"failure\", \"reason\": \"one sentence\"}}'
+        )
+
+        import json
+        response = llm.invoke(prompt)
+        text = response.content.strip() if hasattr(response, "content") else str(response).strip()
+
+        try:
+            if "```" in text:
+                text = text.split("```")[1].removeprefix("json").strip()
+            evaluation = json.loads(text)
+        except (json.JSONDecodeError, IndexError):
+            evaluation = {"score": 0.5, "result": "partial", "reason": text[:100]}
+
+        score = float(evaluation.get("score", 0.5))
+        result = evaluation.get("result", "partial")
+        if result not in ("success", "failure", "partial"):
+            result = "success" if score > 0.5 else "failure"
+        reason = evaluation.get("reason", "")
+        reward = max(-1.0, min(1.0, score * 2 - 1))
+
+        return self.observe(
+            agent, action=action, result=result, reward=round(reward, 3),
+            content=reason,
         )
 
     # -----------------------------------------------------------------

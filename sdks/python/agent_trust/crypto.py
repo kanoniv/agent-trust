@@ -47,6 +47,80 @@ class KeyPair:
         return base64.urlsafe_b64encode(raw).decode()
 
 
+class AgentIdentity:
+    """Portable agent identity. Agents carry this across services.
+
+    Production usage:
+        # Agent creates identity once
+        identity = AgentIdentity.generate("researcher")
+        identity.save("~/.agent-trust/researcher.key")
+
+        # On every startup, load from disk
+        identity = AgentIdentity.load("~/.agent-trust/researcher.key")
+
+        # Register with any TrustAgent
+        trust.register("researcher", did=identity.did, capabilities=["search"])
+
+        # Agent signs its own actions
+        sig, ts = identity.sign_action("search", result="success", reward=0.9)
+        trust.observe("researcher", action="search", result="success",
+                      reward=0.9, signature=sig, signed_at=ts)
+    """
+
+    def __init__(self, name: str, keys: KeyPair):
+        self.name = name
+        self.keys = keys
+
+    @property
+    def did(self) -> str:
+        return self.keys.did
+
+    @classmethod
+    def generate(cls, name: str) -> "AgentIdentity":
+        """Generate a new agent identity."""
+        return cls(name, generate_keys())
+
+    @classmethod
+    def load(cls, path: str) -> "AgentIdentity":
+        """Load identity from a key file."""
+        import json as _json
+        from pathlib import Path
+        data = _json.loads(Path(path).expanduser().read_text())
+        keys = load_keys(data["private_key"])
+        return cls(data["name"], keys)
+
+    def save(self, path: str) -> None:
+        """Save identity to a key file."""
+        import json as _json
+        from pathlib import Path
+        p = Path(path).expanduser()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_json.dumps({
+            "name": self.name,
+            "did": self.did,
+            "private_key": self.keys.export_private(),
+        }, indent=2))
+
+    def sign_action(
+        self,
+        action: str,
+        result: str,
+        reward: float,
+        entity_ids: list[str] | None = None,
+    ) -> tuple[str, float]:
+        """Sign an action for submission to a TrustAgent.
+
+        Returns (signature, timestamp) tuple. Pass both to trust.observe().
+        """
+        import time
+        ts = time.time()
+        sig = sign_provenance(
+            self.keys, action, entity_ids or [],
+            {"result": result, "reward": reward}, ts,
+        )
+        return sig, ts
+
+
 def generate_keys() -> KeyPair:
     """Generate a new Ed25519 key pair with a did:key identifier."""
     private = Ed25519PrivateKey.generate()
