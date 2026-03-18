@@ -26,6 +26,7 @@ class ProvenanceRecord:
     signature: str | None = None  # Ed25519 signature
     verified: bool = False
     created_at: float = 0.0
+    id: str | None = None  # unique provenance ID for linking to outcomes
 
 
 @dataclass

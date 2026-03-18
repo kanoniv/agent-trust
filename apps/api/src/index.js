@@ -110,7 +110,9 @@ async function updateReputation(agentDid) {
     const tenureDays = Math.floor((Date.now() - new Date(registered_at).getTime()) / 86400000);
 
     // Composite score (0-100): weighted blend
-    const activityScore = Math.min(100, Math.log2(total + 1) * 15);   // 30% weight
+    // Activity uses sigmoid-like curve: diminishing returns, not log-linear
+    // 10 actions ≈ 39, 20 ≈ 63, 50 ≈ 92, 100 ≈ 99
+    const activityScore = 100 * (1 - Math.exp(-total / 20));           // 30% weight
     const successScore = successRate * 100;                             // 25% weight
     const rewardScore = ((avgReward + 1) / 2) * 100;                   // 20% weight
     const tenureScore = Math.min(100, (tenureDays / 90) * 100);        // 15% weight
@@ -288,10 +290,17 @@ app.delete('/v1/delegations/:id', async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get('/v1/provenance', async (req, res) => {
   const limit = parseInt(req.query.limit) || 50;
+  const { agent_name } = req.query;
   try {
-    const result = await pool.query(
-      `SELECT * FROM provenance ORDER BY created_at DESC LIMIT $1`, [limit]
-    );
+    let query, params;
+    if (agent_name) {
+      query = `SELECT * FROM provenance WHERE agent_name = $1 ORDER BY created_at DESC LIMIT $2`;
+      params = [agent_name, limit];
+    } else {
+      query = `SELECT * FROM provenance ORDER BY created_at DESC LIMIT $1`;
+      params = [limit];
+    }
+    const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (e) {
     res.status(500).json({ error: e.message });

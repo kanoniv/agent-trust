@@ -104,6 +104,14 @@ class TrustAgent:
       - TrustAgent(backend=custom)  -> any Backend implementation
     """
 
+    DEFAULT_REPUTATION_WEIGHTS: dict[str, float] = {
+        "activity": 0.30,
+        "success": 0.25,
+        "reward": 0.20,
+        "tenure": 0.15,
+        "diversity": 0.10,
+    }
+
     def __init__(
         self,
         url: str | None = None,
@@ -111,6 +119,7 @@ class TrustAgent:
         backend: Backend | None = None,
         private_key: str | None = None,
         authority: str = "admin",
+        reputation_weights: dict[str, float] | None = None,
     ):
         # Backend
         if backend is not None:
@@ -130,6 +139,18 @@ class TrustAgent:
         self._authority = authority
         self._name = "trust-agent"
         self._agent_keys: dict[str, KeyPair] = {}
+
+        # Configurable reputation weights (must sum to ~1.0)
+        if reputation_weights is not None:
+            expected = set(self.DEFAULT_REPUTATION_WEIGHTS.keys())
+            if set(reputation_weights.keys()) != expected:
+                raise ValueError(f"reputation_weights must have keys: {expected}")
+            total = sum(reputation_weights.values())
+            if not (0.99 <= total <= 1.01):
+                raise ValueError(f"reputation_weights must sum to 1.0, got {total}")
+            self._reputation_weights = dict(reputation_weights)
+        else:
+            self._reputation_weights = dict(self.DEFAULT_REPUTATION_WEIGHTS)
 
         # Register self
         self._backend.register(
@@ -246,16 +267,70 @@ class TrustAgent:
     # authorized - check if an agent can perform an action
     # -----------------------------------------------------------------
 
-    def authorized(self, agent: str, scope: str) -> bool:
+    def authorized(self, agent: str, scope: str, context: dict | None = None) -> bool:
         """Check if an agent is authorized to perform an action.
 
         Agents should call this before acting. Returns False if
-        the scope was never granted or has been restricted/revoked.
+        the scope was never granted, has been restricted/revoked,
+        or if delegation caveats are violated.
+
+        Args:
+            agent: The agent to check
+            scope: The permission scope to check
+            context: Runtime context to validate against caveats.
+                     e.g. {"cost": 50} checked against caveat {"max_cost": 100}
+
+        Caveat enforcement rules:
+            - max_<key>: context[key] must be <= caveat value
+            - min_<key>: context[key] must be >= caveat value
+            - allowed_<key>: context[key] must be in caveat list
+            - Other caveats are stored but not auto-enforced (available via get_caveats)
         """
         record = self._backend.get_agent(agent)
         if record is None:
             return False
-        return scope in record.scopes
+        if scope not in record.scopes:
+            return False
+
+        # If no context provided, scope check is sufficient
+        if not context:
+            return True
+
+        # Enforce caveats from active delegations
+        delegations = self._backend.get_delegations(agent)
+        now = time.time()
+        for deleg in delegations:
+            if deleg.revoked:
+                continue
+            if deleg.expires_at is not None and deleg.expires_at < now:
+                continue
+            if scope not in deleg.scopes:
+                continue
+            if not deleg.caveats:
+                continue
+            if not _check_caveats(deleg.caveats, context):
+                return False
+
+        return True
+
+    def get_caveats(self, agent: str, scope: str | None = None) -> dict:
+        """Get the active caveats for an agent's delegation.
+
+        Returns merged caveats from all active delegations that include
+        the given scope (or all delegations if scope is None).
+        """
+        delegations = self._backend.get_delegations(agent)
+        now = time.time()
+        merged: dict = {}
+        for deleg in delegations:
+            if deleg.revoked:
+                continue
+            if deleg.expires_at is not None and deleg.expires_at < now:
+                continue
+            if scope is not None and scope not in deleg.scopes:
+                continue
+            merged.update(deleg.caveats)
+        return merged
 
     # -----------------------------------------------------------------
     # observe - record and verify an agent's action
@@ -328,7 +403,7 @@ class TrustAgent:
             verified=verified,
         )
 
-        # Record outcome linked to provenance
+        # Record outcome linked to provenance via ID
         outcome = self._backend.record_outcome(
             agent=agent,
             action=action,
@@ -336,7 +411,7 @@ class TrustAgent:
             reward=reward,
             content=content,
             reporter=self._name,
-            provenance_id=None,
+            provenance_id=prov.id,
         )
 
         # TrustAgent signs its own observation
@@ -422,7 +497,7 @@ class TrustAgent:
 
         return ReputationReport(
             agent=agent,
-            score=_compute_reputation_score(record, summary),
+            score=_compute_reputation_score(record, summary, self._reputation_weights),
             success_rate=summary["success_rate"],
             avg_reward=summary["avg_reward"],
             total_actions=summary["total"],
@@ -669,24 +744,79 @@ def _ucb_score(summary: dict, n_agents: int, c: float) -> float:
     return normalized + bonus
 
 
-def _compute_reputation_score(record: AgentRecord, summary: dict) -> float:
-    """Composite reputation score (0-100)."""
+def _compute_reputation_score(
+    record: AgentRecord, summary: dict, weights: dict[str, float] | None = None,
+) -> float:
+    """Composite reputation score (0-100).
+
+    Activity uses a sigmoid-like curve: 100 * (1 - e^(-total/20)).
+    This gives diminishing returns: 10 actions ≈ 39, 20 ≈ 63, 50 ≈ 92, 100 ≈ 99.
+    An agent must demonstrate sustained quality, not just volume.
+
+    Weights are configurable. Defaults: activity=0.30, success=0.25,
+    reward=0.20, tenure=0.15, diversity=0.10.
+    """
+    if weights is None:
+        weights = TrustAgent.DEFAULT_REPUTATION_WEIGHTS
+
     total = summary["total"]
     success_rate = summary["success_rate"] if summary["success_rate"] is not None else 1.0
     avg_reward = summary["avg_reward"] if summary["avg_reward"] is not None else 0.0
     action_types = len(set(summary["top_success"] + summary["top_failure"]))
     tenure_days = (time.time() - record.registered_at) / 86400
 
-    activity = min(100, math.log2(total + 1) * 15)
+    # Sigmoid-like curve: diminishing returns, not linear-log
+    activity = 100 * (1 - math.exp(-total / 20))
     success = success_rate * 100
     reward = ((avg_reward + 1) / 2) * 100
     tenure = min(100, (tenure_days / 90) * 100)
     diversity = min(100, (action_types / 7) * 100)
 
     return round(
-        activity * 0.30 + success * 0.25 + reward * 0.20
-        + tenure * 0.15 + diversity * 0.10, 1,
+        activity * weights["activity"]
+        + success * weights["success"]
+        + reward * weights["reward"]
+        + tenure * weights["tenure"]
+        + diversity * weights["diversity"],
+        1,
     )
+
+
+def _check_caveats(caveats: dict, context: dict) -> bool:
+    """Check if runtime context satisfies delegation caveats.
+
+    Supported caveat patterns:
+        max_<key>: context[key] must be <= value
+        min_<key>: context[key] must be >= value
+        allowed_<key>: context[key] must be in the allowed list
+
+    Returns True if all caveats are satisfied or not applicable.
+    """
+    for caveat_key, caveat_val in caveats.items():
+        if caveat_key.startswith("max_"):
+            ctx_key = caveat_key[4:]  # strip "max_"
+            if ctx_key in context:
+                try:
+                    if float(context[ctx_key]) > float(caveat_val):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+        elif caveat_key.startswith("min_"):
+            ctx_key = caveat_key[4:]  # strip "min_"
+            if ctx_key in context:
+                try:
+                    if float(context[ctx_key]) < float(caveat_val):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+        elif caveat_key.startswith("allowed_"):
+            ctx_key = caveat_key[8:]  # strip "allowed_"
+            if ctx_key in context:
+                if not isinstance(caveat_val, list):
+                    return False
+                if context[ctx_key] not in caveat_val:
+                    return False
+    return True
 
 
 def _generate_guidance(agent: str, summary: dict, recent: list[dict]) -> str:

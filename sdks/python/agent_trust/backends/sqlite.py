@@ -133,6 +133,7 @@ class SQLiteBackend:
             signature=signature,
             verified=verified,
             created_at=now,
+            id=prov_id,
         )
 
     def get_provenance(
@@ -303,4 +304,5 @@ class SQLiteBackend:
             signature=row["signature"],
             verified=bool(row["verified"]),
             created_at=row["created_at"],
+            id=row["id"],
         )

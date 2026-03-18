@@ -624,3 +624,180 @@ def test_agent_keys_sign_and_verify(trust):
     msg = b"test message"
     sig = keys.sign(msg)
     assert verify_signature(keys.did, msg, sig)
+
+
+# -- caveat enforcement --
+
+def test_authorized_with_max_caveat_passes(trust):
+    trust.register("agent", capabilities=["spend"])
+    trust.delegate("agent", scopes=["spend"], caveats={"max_cost": 100})
+    assert trust.authorized("agent", "spend", context={"cost": 50}) is True
+
+def test_authorized_with_max_caveat_exact_boundary(trust):
+    trust.register("agent", capabilities=["spend"])
+    trust.delegate("agent", scopes=["spend"], caveats={"max_cost": 100})
+    assert trust.authorized("agent", "spend", context={"cost": 100}) is True
+
+def test_authorized_with_max_caveat_fails(trust):
+    trust.register("agent", capabilities=["spend"])
+    trust.delegate("agent", scopes=["spend"], caveats={"max_cost": 100})
+    assert trust.authorized("agent", "spend", context={"cost": 150}) is False
+
+def test_authorized_with_min_caveat_passes(trust):
+    trust.register("agent", capabilities=["bid"])
+    trust.delegate("agent", scopes=["bid"], caveats={"min_price": 10})
+    assert trust.authorized("agent", "bid", context={"price": 20}) is True
+
+def test_authorized_with_min_caveat_fails(trust):
+    trust.register("agent", capabilities=["bid"])
+    trust.delegate("agent", scopes=["bid"], caveats={"min_price": 10})
+    assert trust.authorized("agent", "bid", context={"price": 5}) is False
+
+def test_authorized_with_allowed_caveat_passes(trust):
+    trust.register("agent", capabilities=["access_db"])
+    trust.delegate("agent", scopes=["access_db"], caveats={"allowed_tables": ["users", "orders"]})
+    assert trust.authorized("agent", "access_db", context={"tables": "users"}) is True
+
+def test_authorized_with_allowed_caveat_fails(trust):
+    trust.register("agent", capabilities=["access_db"])
+    trust.delegate("agent", scopes=["access_db"], caveats={"allowed_tables": ["users", "orders"]})
+    assert trust.authorized("agent", "access_db", context={"tables": "secrets"}) is False
+
+def test_authorized_no_context_skips_caveat_check(trust):
+    """When no context is provided, only scope is checked (backwards compatible)."""
+    trust.register("agent", capabilities=["spend"])
+    trust.delegate("agent", scopes=["spend"], caveats={"max_cost": 100})
+    assert trust.authorized("agent", "spend") is True
+
+def test_authorized_irrelevant_context_key_ignored(trust):
+    """Context keys not matching any caveat pattern are ignored."""
+    trust.register("agent", capabilities=["search"])
+    trust.delegate("agent", scopes=["search"], caveats={"max_cost": 100})
+    assert trust.authorized("agent", "search", context={"unrelated": "value"}) is True
+
+def test_authorized_multiple_caveats_all_must_pass(trust):
+    trust.register("agent", capabilities=["trade"])
+    trust.delegate("agent", scopes=["trade"], caveats={"max_cost": 100, "min_quantity": 5})
+    assert trust.authorized("agent", "trade", context={"cost": 50, "quantity": 10}) is True
+    assert trust.authorized("agent", "trade", context={"cost": 50, "quantity": 2}) is False
+    assert trust.authorized("agent", "trade", context={"cost": 200, "quantity": 10}) is False
+
+def test_authorized_caveat_non_numeric_max_fails(trust):
+    """Non-numeric values for max/min caveats should fail safely."""
+    trust.register("agent", capabilities=["spend"])
+    trust.delegate("agent", scopes=["spend"], caveats={"max_cost": 100})
+    assert trust.authorized("agent", "spend", context={"cost": "not-a-number"}) is False
+
+def test_get_caveats_returns_active_caveats(trust):
+    trust.register("agent", capabilities=["spend", "search"])
+    trust.delegate("agent", scopes=["spend", "search"], caveats={"max_cost": 100, "allowed_tables": ["users"]})
+    caveats = trust.get_caveats("agent")
+    assert caveats == {"max_cost": 100, "allowed_tables": ["users"]}
+
+def test_get_caveats_scoped(trust):
+    trust.register("agent", capabilities=["spend", "search"])
+    trust.delegate("agent", scopes=["spend"], caveats={"max_cost": 100})
+    # Only the "spend" delegation has caveats
+    assert trust.get_caveats("agent", scope="spend") == {"max_cost": 100}
+    # No delegation with scope "search" exists
+    assert trust.get_caveats("agent", scope="search") == {}
+
+def test_get_caveats_empty_after_revoke(trust):
+    trust.register("agent", capabilities=["spend"])
+    trust.delegate("agent", scopes=["spend"], caveats={"max_cost": 100})
+    trust.revoke("agent")
+    assert trust.get_caveats("agent") == {}
+
+
+# -- provenance ID linking --
+
+def test_observe_links_provenance_id(trust):
+    """Outcomes must be linked to their provenance record via ID."""
+    trust.register("agent")
+    trust.observe("agent", action="search", result="success", reward=0.9)
+    prov = trust._backend.get_provenance("agent")
+    assert len(prov) == 1
+    assert prov[0].id is not None
+    # The outcome should reference this provenance
+    outcomes = trust._backend.get_outcomes("agent")
+    assert len(outcomes) == 1
+    assert outcomes[0].provenance_id == prov[0].id
+
+def test_provenance_id_unique(trust):
+    """Each provenance record gets a unique ID."""
+    trust.register("agent")
+    trust.observe("agent", action="a", result="success", reward=0.5)
+    trust.observe("agent", action="b", result="success", reward=0.6)
+    prov = trust._backend.get_provenance("agent")
+    assert prov[0].id != prov[1].id
+
+def test_provenance_id_is_uuid(trust):
+    """Provenance IDs should be valid UUIDs."""
+    import uuid
+    trust.register("agent")
+    trust.observe("agent", action="search", result="success", reward=0.9)
+    prov = trust._backend.get_provenance("agent")
+    uuid.UUID(prov[0].id)  # raises if not valid UUID
+
+
+# -- configurable reputation weights --
+
+def test_custom_reputation_weights(tmp_path):
+    """Custom weights change the reputation score."""
+    default_trust = TrustAgent(db_path=str(tmp_path / "default.db"))
+    custom_trust = TrustAgent(
+        db_path=str(tmp_path / "custom.db"),
+        reputation_weights={
+            "activity": 0.10,
+            "success": 0.50,
+            "reward": 0.20,
+            "tenure": 0.10,
+            "diversity": 0.10,
+        },
+    )
+    # Same agent, same outcomes in both
+    for t in [default_trust, custom_trust]:
+        t.register("agent")
+        for _ in range(10):
+            t.observe("agent", action="task", result="success", reward=0.9)
+    rep_default = default_trust.reputation("agent")
+    rep_custom = custom_trust.reputation("agent")
+    # Custom weights success at 50% vs 25% should produce different scores
+    assert rep_default.score != rep_custom.score
+
+def test_invalid_reputation_weights_wrong_keys(tmp_path):
+    with pytest.raises(ValueError, match="reputation_weights must have keys"):
+        TrustAgent(
+            db_path=str(tmp_path / "bad.db"),
+            reputation_weights={"activity": 0.5, "success": 0.5},
+        )
+
+def test_invalid_reputation_weights_wrong_sum(tmp_path):
+    with pytest.raises(ValueError, match="must sum to 1.0"):
+        TrustAgent(
+            db_path=str(tmp_path / "bad.db"),
+            reputation_weights={
+                "activity": 0.30, "success": 0.30, "reward": 0.30,
+                "tenure": 0.30, "diversity": 0.30,
+            },
+        )
+
+
+# -- activity score curve --
+
+def test_activity_score_diminishing_returns(tmp_path):
+    """Activity score should show diminishing returns, not linear growth.
+    8 actions should NOT be nearly max score anymore."""
+    trust = TrustAgent(db_path=str(tmp_path / "activity.db"))
+    trust.register("low")
+    trust.register("high")
+    for _ in range(8):
+        trust.observe("low", action="task", result="success", reward=0.9)
+    for _ in range(50):
+        trust.observe("high", action="task", result="success", reward=0.9)
+    rep_low = trust.reputation("low")
+    rep_high = trust.reputation("high")
+    # With old formula: 8 actions gives log2(9)*15 = 47.5 out of 100 (47% activity)
+    # With new formula: 8 actions gives 100*(1-e^(-8/20)) = 33.0 (33% activity)
+    # The gap between 8 and 50 actions should be meaningful
+    assert rep_high.score > rep_low.score + 5  # meaningful gap
